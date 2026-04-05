@@ -314,10 +314,11 @@ impl BackendDevice for CudaDevice {
     fn new(ordinal: usize) -> Result<Self> {
         let context = cudarc::driver::CudaContext::new(ordinal).w()?;
         // Use a non-blocking stream for CUDA graph capture support.
-        // Event tracking is disabled to prevent data corruption during model loading
-        // (cudarc inserts events between operations that can race with H2D copies).
+        // Event tracking is disabled — we use a single stream so ordering is implicit.
         unsafe { context.disable_event_tracking(); }
         let stream = context.new_stream().w()?;
+        // Synchronize the context to ensure the stream is fully initialized
+        context.synchronize().w()?;
         let blas = cudarc::cublas::CudaBlas::new(stream.clone()).w()?;
         let curand = cudarc::curand::CudaRng::new(299792458, stream.clone()).w()?;
         let module_store = ModuleStore {
