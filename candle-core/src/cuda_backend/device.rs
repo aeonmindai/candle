@@ -313,12 +313,13 @@ impl BackendDevice for CudaDevice {
 
     fn new(ordinal: usize) -> Result<Self> {
         let context = cudarc::driver::CudaContext::new(ordinal).w()?;
-        // Use a non-blocking stream for CUDA graph capture support.
-        // Event tracking is disabled — we use a single stream so ordering is implicit.
-        unsafe { context.disable_event_tracking(); }
-        let stream = context.new_stream().w()?;
-        // Synchronize the context to ensure the stream is fully initialized
-        context.synchronize().w()?;
+        // Use the per-thread default stream for CUDA graph capture support.
+        // The per-thread default stream (0x2) is:
+        // - Non-NULL (supports cuStreamBeginCapture)
+        // - Synchronizes with the legacy stream within the same thread
+        // - Does NOT require event tracking
+        // This is the ideal stream for single-threaded inference + graph capture.
+        let stream = context.per_thread_stream();
         let blas = cudarc::cublas::CudaBlas::new(stream.clone()).w()?;
         let curand = cudarc::curand::CudaRng::new(299792458, stream.clone()).w()?;
         let module_store = ModuleStore {
