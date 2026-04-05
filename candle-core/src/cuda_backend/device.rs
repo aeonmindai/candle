@@ -155,22 +155,31 @@ impl CudaDevice {
         self.stream.clone()
     }
 
-    /// Create a clone of this device with a CU_STREAM_DEFAULT stream instead of
-    /// the NULL legacy stream. The new stream is non-NULL (supports CUDA graph capture)
-    /// but synchronizes with the legacy default stream (preserves cuBLAS semantics).
+    /// Create a clone of this device with a CU_STREAM_NON_BLOCKING stream.
+    /// Non-NULL (supports CUDA graph capture) and doesn't implicitly synchronize
+    /// with the legacy stream (avoids CUDA_ERROR_STREAM_CAPTURE_IMPLICIT during capture).
     ///
-    /// Call this AFTER model loading to enable CUDA graph capture. Model loading
-    /// must happen on the original NULL stream device.
+    /// Event tracking is disabled to prevent data corruption.
+    /// Synchronize the NULL stream before using this device to ensure all
+    /// model weights are fully loaded.
     ///
-    /// # Safety
-    /// The returned device shares the same context, modules, cuBLAS handle, etc.
-    /// Tensors created on the original device and the new device are on the same GPU
-    /// and can interoperate. Event tracking is disabled on the new device.
+    /// Call AFTER model loading. Model loading must use the original NULL stream.
     pub fn with_capturable_stream(&self) -> Result<Self> {
-        let stream = unsafe { self.context.new_primary_stream() }.w()?;
+        // Synchronize the legacy stream to ensure all model weights are on GPU
+        self.context.bind_to_thread().w()?;
+        self.stream.synchronize().w()?;
+
+        // Disable event tracking — we manage synchronization explicitly
+        unsafe { self.context.disable_event_tracking(); }
+
+        // Create a non-blocking stream (capturable, no implicit sync with legacy)
+        let stream = self.context.new_stream().w()?;
+
+        // Create new cuBLAS and cuRAND handles on the new stream
         let blas = cudarc::cublas::CudaBlas::new(stream.clone()).w()?;
         let curand_seed = *self.seed_value.read().unwrap();
         let curand = cudarc::curand::CudaRng::new(curand_seed, stream.clone()).w()?;
+
         Ok(Self {
             id: DeviceId::new(),
             context: self.context.clone(),
