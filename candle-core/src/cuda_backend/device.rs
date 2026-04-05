@@ -276,10 +276,13 @@ impl BackendDevice for CudaDevice {
 
     fn new(ordinal: usize) -> Result<Self> {
         let context = cudarc::driver::CudaContext::new(ordinal).w()?;
-        // Use new_stream() instead of default_stream() to get a real (non-NULL) stream.
+        // Use new_default_stream() instead of default_stream() to get a real (non-NULL) stream.
         // The NULL legacy stream cannot be captured by CUDA graphs.
-        // new_stream() creates a non-blocking stream that supports cuStreamBeginCapture.
-        let stream = context.new_stream().w()?;
+        // new_default_stream() creates a CU_STREAM_DEFAULT stream: non-NULL (capturable)
+        // but synchronizes with the legacy default stream (preserves implicit sync semantics
+        // that cuBLAS depends on). This is the key difference from new_stream() which uses
+        // CU_STREAM_NON_BLOCKING and breaks cuBLAS synchronization.
+        let stream = context.new_default_stream().w()?;
         let blas = cudarc::cublas::CudaBlas::new(stream.clone()).w()?;
         let curand = cudarc::curand::CudaRng::new(299792458, stream.clone()).w()?;
         let module_store = ModuleStore {
