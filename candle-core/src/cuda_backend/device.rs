@@ -276,7 +276,10 @@ impl BackendDevice for CudaDevice {
 
     fn new(ordinal: usize) -> Result<Self> {
         let context = cudarc::driver::CudaContext::new(ordinal).w()?;
-        let stream = context.default_stream();
+        // Use new_stream() instead of default_stream() to get a real (non-NULL) stream.
+        // The NULL legacy stream cannot be captured by CUDA graphs.
+        // new_stream() creates a non-blocking stream that supports cuStreamBeginCapture.
+        let stream = context.new_stream().w()?;
         let blas = cudarc::cublas::CudaBlas::new(stream.clone()).w()?;
         let curand = cudarc::curand::CudaRng::new(299792458, stream.clone()).w()?;
         let module_store = ModuleStore {
