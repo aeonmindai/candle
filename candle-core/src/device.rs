@@ -271,6 +271,15 @@ impl Device {
         Ok(self.clone())
     }
 
+    /// Synchronize the device's stream. Ensures all pending GPU operations complete.
+    pub fn synchronize(&self) -> Result<()> {
+        match self {
+            #[cfg(feature = "cuda")]
+            Self::Cuda(d) => d.synchronize(),
+            _ => Ok(()),
+        }
+    }
+
     pub fn new_metal(ordinal: usize) -> Result<Self> {
         Ok(Self::Metal(crate::MetalDevice::new(ordinal)?))
     }

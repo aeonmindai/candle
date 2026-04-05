@@ -155,6 +155,12 @@ impl CudaDevice {
         self.stream.clone()
     }
 
+    /// Synchronize the device's stream, ensuring all pending operations complete.
+    /// Call after model loading to ensure all H2D copies are finished before compute.
+    pub fn synchronize(&self) -> Result<()> {
+        self.stream.synchronize().w()
+    }
+
     /// Create a clone of this device with a CU_STREAM_NON_BLOCKING stream.
     /// Non-NULL (supports CUDA graph capture) and doesn't implicitly synchronize
     /// with the legacy stream (avoids CUDA_ERROR_STREAM_CAPTURE_IMPLICIT during capture).
@@ -313,10 +319,11 @@ impl BackendDevice for CudaDevice {
 
     fn new(ordinal: usize) -> Result<Self> {
         let context = cudarc::driver::CudaContext::new(ordinal).w()?;
-        // Use the legacy default stream (NULL) for now.
-        // Model loading requires synchronous H2D copies that only work with the NULL stream.
-        // After loading, the graph runner can create a dedicated capturable stream.
-        let stream = context.default_stream();
+        // Use a non-blocking stream for CUDA graph capture support.
+        // Event tracking is disabled to prevent data corruption during model loading
+        // (cudarc inserts events between operations that can race with H2D copies).
+        unsafe { context.disable_event_tracking(); }
+        let stream = context.new_stream().w()?;
         let blas = cudarc::cublas::CudaBlas::new(stream.clone()).w()?;
         let curand = cudarc::curand::CudaRng::new(299792458, stream.clone()).w()?;
         let module_store = ModuleStore {
