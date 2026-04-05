@@ -258,11 +258,17 @@ impl Device {
     /// Create a new Device that uses a CU_STREAM_DEFAULT stream instead of NULL.
     /// Enables CUDA graph capture while preserving legacy sync semantics.
     /// Call AFTER model loading (model loading requires the NULL stream).
+    #[cfg(feature = "cuda")]
     pub fn with_capturable_stream(&self) -> Result<Self> {
         match self {
             Self::Cuda(d) => Ok(Self::Cuda(d.with_capturable_stream()?)),
             other => Ok(other.clone()),
         }
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    pub fn with_capturable_stream(&self) -> Result<Self> {
+        Ok(self.clone())
     }
 
     pub fn new_metal(ordinal: usize) -> Result<Self> {
