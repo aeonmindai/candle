@@ -276,9 +276,10 @@ impl BackendDevice for CudaDevice {
 
     fn new(ordinal: usize) -> Result<Self> {
         let context = cudarc::driver::CudaContext::new(ordinal).w()?;
-        // new_primary_stream: CU_STREAM_DEFAULT (non-NULL, capturable, legacy-sync safe)
-        // + disables event tracking (prevents data corruption during model loading)
-        let stream = unsafe { context.new_primary_stream() }.w()?;
+        // Use the legacy default stream (NULL) for now.
+        // Model loading requires synchronous H2D copies that only work with the NULL stream.
+        // After loading, the graph runner can create a dedicated capturable stream.
+        let stream = context.default_stream();
         let blas = cudarc::cublas::CudaBlas::new(stream.clone()).w()?;
         let curand = cudarc::curand::CudaRng::new(299792458, stream.clone()).w()?;
         let module_store = ModuleStore {
