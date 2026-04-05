@@ -283,6 +283,12 @@ impl BackendDevice for CudaDevice {
         // that cuBLAS depends on). This is the key difference from new_stream() which uses
         // CU_STREAM_NON_BLOCKING and breaks cuBLAS synchronization.
         let stream = context.new_default_stream().w()?;
+        // Disable event tracking to avoid synchronization issues during model loading.
+        // With event tracking, cudarc inserts events between operations on different
+        // streams. Since we're using a single CU_STREAM_DEFAULT stream that synchronizes
+        // with the legacy stream, event tracking is unnecessary and can cause data races
+        // during mmap'd safetensor loading.
+        unsafe { context.disable_event_tracking(); }
         let blas = cudarc::cublas::CudaBlas::new(stream.clone()).w()?;
         let curand = cudarc::curand::CudaRng::new(299792458, stream.clone()).w()?;
         let module_store = ModuleStore {
