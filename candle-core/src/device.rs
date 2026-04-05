@@ -255,6 +255,16 @@ impl Device {
         Ok(Self::Cuda(crate::CudaDevice::new_with_stream(ordinal)?))
     }
 
+    /// Create a new Device that uses a CU_STREAM_DEFAULT stream instead of NULL.
+    /// Enables CUDA graph capture while preserving legacy sync semantics.
+    /// Call AFTER model loading (model loading requires the NULL stream).
+    pub fn with_capturable_stream(&self) -> Result<Self> {
+        match self {
+            Self::Cuda(d) => Ok(Self::Cuda(d.with_capturable_stream()?)),
+            other => Ok(other.clone()),
+        }
+    }
+
     pub fn new_metal(ordinal: usize) -> Result<Self> {
         Ok(Self::Metal(crate::MetalDevice::new(ordinal)?))
     }

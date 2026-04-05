@@ -155,6 +155,34 @@ impl CudaDevice {
         self.stream.clone()
     }
 
+    /// Create a clone of this device with a CU_STREAM_DEFAULT stream instead of
+    /// the NULL legacy stream. The new stream is non-NULL (supports CUDA graph capture)
+    /// but synchronizes with the legacy default stream (preserves cuBLAS semantics).
+    ///
+    /// Call this AFTER model loading to enable CUDA graph capture. Model loading
+    /// must happen on the original NULL stream device.
+    ///
+    /// # Safety
+    /// The returned device shares the same context, modules, cuBLAS handle, etc.
+    /// Tensors created on the original device and the new device are on the same GPU
+    /// and can interoperate. Event tracking is disabled on the new device.
+    pub fn with_capturable_stream(&self) -> Result<Self> {
+        let stream = unsafe { self.context.new_primary_stream() }.w()?;
+        let blas = cudarc::cublas::CudaBlas::new(stream.clone()).w()?;
+        let curand_seed = *self.seed_value.read().unwrap();
+        let curand = cudarc::curand::CudaRng::new(curand_seed, stream.clone()).w()?;
+        Ok(Self {
+            id: DeviceId::new(),
+            context: self.context.clone(),
+            modules: self.modules.clone(),
+            custom_modules: self.custom_modules.clone(),
+            stream,
+            blas: Arc::new(blas),
+            curand: Arc::new(Mutex::new(CudaRng(curand))),
+            seed_value: self.seed_value.clone(),
+        })
+    }
+
     /// When turned on, all cuda tensors **created after calling this function** will
     /// not track uses via cuda events.
     ///
