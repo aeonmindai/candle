@@ -155,12 +155,6 @@ impl CudaDevice {
         self.stream.clone()
     }
 
-    /// Synchronize the device's stream, ensuring all pending operations complete.
-    /// Call after model loading to ensure all H2D copies are finished before compute.
-    pub fn synchronize(&self) -> Result<()> {
-        self.stream.synchronize().w()
-    }
-
     /// Create a clone of this device with a CU_STREAM_NON_BLOCKING stream.
     /// Non-NULL (supports CUDA graph capture) and doesn't implicitly synchronize
     /// with the legacy stream (avoids CUDA_ERROR_STREAM_CAPTURE_IMPLICIT during capture).
