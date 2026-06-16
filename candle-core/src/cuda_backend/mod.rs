@@ -21,14 +21,14 @@ pub use error::{CudaError, WrapErr};
 pub use utils::{Map1, Map1Any, Map2, Map2Any, Map2InPlace, Map3, S};
 
 pub enum SlicePtrOrNull<T> {
-    Ptr(CudaSlice<T>),
+    Ptr(InfoBuf<T>),
     Null,
 }
 
 impl<T: DeviceRepr> SlicePtrOrNull<T> {
     pub fn builder_arg<'a, 'b: 'a>(&'b self, builder: &mut cudarc::driver::LaunchArgs<'a>) {
         match self {
-            SlicePtrOrNull::Ptr(slice) => builder.arg(slice),
+            SlicePtrOrNull::Ptr(slice) => builder.arg(slice.as_arg()),
             SlicePtrOrNull::Null => builder.arg(&0usize),
         };
     }
@@ -57,9 +57,55 @@ impl SlicePtrOrNull<usize> {
         let ds = if l.is_contiguous() {
             SlicePtrOrNull::Null
         } else {
-            SlicePtrOrNull::Ptr(dev.clone_htod(&[l.dims(), l.stride()].concat())?)
+            SlicePtrOrNull::Ptr(dev.htod_info(&[l.dims(), l.stride()].concat())?)
         };
         Ok(ds)
+    }
+}
+
+/// Per-op layout/info upload buffer (dims+strides) that returns to the device
+/// caching allocator on drop instead of cuMemFreeAsync -- giving it a STABLE
+/// address during CUDA-graph capture. The raw CudaSlice from `clone_htod` frees
+/// on drop, which corrupts a captured graph (a reduction kernel then reads an
+/// unstable info buffer -> MMU fault on launch). When caching is OFF this frees
+/// normally (identical to upstream). (RUN-161)
+pub struct InfoBuf<T> {
+    slice: std::mem::ManuallyDrop<CudaSlice<T>>,
+    device: CudaDevice,
+}
+
+impl<T> InfoBuf<T> {
+    pub(crate) fn new(device: CudaDevice, slice: CudaSlice<T>) -> Self {
+        Self {
+            slice: std::mem::ManuallyDrop::new(slice),
+            device,
+        }
+    }
+    #[inline]
+    pub fn as_arg(&self) -> &CudaSlice<T> {
+        &self.slice
+    }
+}
+
+impl<T> std::ops::Deref for InfoBuf<T> {
+    type Target = CudaSlice<T>;
+    fn deref(&self) -> &CudaSlice<T> {
+        &self.slice
+    }
+}
+
+impl<T> Drop for InfoBuf<T> {
+    fn drop(&mut self) {
+        if !self.device.alloc_cache_enabled() {
+            unsafe { std::mem::ManuallyDrop::drop(&mut self.slice) };
+            return;
+        }
+        let slice = unsafe { std::mem::ManuallyDrop::take(&mut self.slice) };
+        let bytes = slice.len() * std::mem::size_of::<T>();
+        let ptr = slice.leak();
+        if !self.device.cache_put(bytes, ptr) {
+            drop(unsafe { self.device.cuda_stream_ref().upgrade_device_ptr::<u8>(ptr, 0) });
+        }
     }
 }
 
@@ -187,7 +233,7 @@ impl Map1 for Im2Col1D {
         let l_out = self.l_out(dims[2]);
         let threads = dims[0] * l_out * dims[1];
         let cfg = LaunchConfig::for_num_elems(threads as u32);
-        let ds = dev.clone_htod(&[dims, layout.stride()].concat())?;
+        let ds = dev.htod_info(&[dims, layout.stride()].concat())?;
         let src = &src.slice(layout.start_offset()..);
         let func = dev.get_or_load_func(&kernel_name::<T>("im2col1d"), &kernels::CONV)?;
         // SAFETY: Set later by running the kernel.
@@ -199,7 +245,7 @@ impl Map1 for Im2Col1D {
         barg!(builder, self.stride);
         barg!(builder, self.padding);
         barg!(builder, self.dilation);
-        builder.arg(&ds);
+        builder.arg(ds.as_arg());
         builder.arg(src);
         builder.arg(&dst);
         // SAFETY: ffi.
@@ -238,7 +284,7 @@ impl Map1 for Im2Col {
         let (h_out, w_out) = self.hw_out(dims[2], dims[3]);
         let dst_el = dims[0] * h_out * w_out * dims[1] * self.h_k * self.w_k;
         let cfg = LaunchConfig::for_num_elems(dst_el as u32);
-        let ds = dev.clone_htod(&[dims, layout.stride()].concat())?;
+        let ds = dev.htod_info(&[dims, layout.stride()].concat())?;
         let src = &src.slice(layout.start_offset()..);
         let func = dev.get_or_load_func(&kernel_name::<T>("im2col"), &kernels::CONV)?;
         // SAFETY: Set later by running the kernel.
@@ -252,7 +298,7 @@ impl Map1 for Im2Col {
         barg!(builder, self.stride);
         barg!(builder, self.padding);
         barg!(builder, self.dilation);
-        builder.arg(&ds);
+        builder.arg(ds.as_arg());
         builder.arg(src);
         builder.arg(&dst);
         // SAFETY: ffi.
@@ -330,7 +376,7 @@ impl Map1Any for FastReduce<'_> {
             block_dim: (block_dim as u32, 1, 1),
             shared_mem_bytes: 0,
         };
-        let ds = dev.clone_htod(&[dims.as_slice(), stride.as_slice()].concat())?;
+        let ds = dev.htod_info(&[dims.as_slice(), stride.as_slice()].concat())?;
         let src = &src.slice(layout.start_offset()..);
         let (name, check_empty, return_index) = match self.1 {
             ReduceOp::Sum => ("fast_sum", false, false),
@@ -350,7 +396,7 @@ impl Map1Any for FastReduce<'_> {
             barg!(builder, src_el);
             barg!(builder, el_to_sum_per_block);
             barg!(builder, src_dims.len());
-            builder.arg(&ds);
+            builder.arg(ds.as_arg());
             builder.arg(src);
             builder.arg(&out);
             // SAFETY: ffi.
@@ -363,7 +409,7 @@ impl Map1Any for FastReduce<'_> {
             barg!(builder, src_el);
             barg!(builder, el_to_sum_per_block);
             barg!(builder, src_dims.len());
-            builder.arg(&ds);
+            builder.arg(ds.as_arg());
             builder.arg(src);
             builder.arg(&out);
             // SAFETY: ffi.
@@ -416,7 +462,7 @@ impl Map1 for IndexSelect<'_> {
         src_l: &Layout,
     ) -> Result<CudaSlice<T>> {
         let ids_l = &self.1;
-        let (name, (ids, _guard)) = match &self.0.slice {
+        let (name, (ids, _guard)) = match &*self.0.slice {
             CudaStorageSlice::U32(slice) => ("is_u32", slice_ptr(slice, ids_l.start_offset())),
             CudaStorageSlice::U8(slice) => ("is_u8", slice_ptr(slice, ids_l.start_offset())),
             CudaStorageSlice::I64(slice) => ("is_i64", slice_ptr(slice, ids_l.start_offset())),
@@ -429,7 +475,7 @@ impl Map1 for IndexSelect<'_> {
         };
         let ids_shape = ids_l.shape();
         let ids_dims = ids_shape.dims();
-        let ds = dev.clone_htod(&[ids_dims, ids_l.stride()].concat())?;
+        let ds = dev.htod_info(&[ids_dims, ids_l.stride()].concat())?;
         let src = match src_l.contiguous_offsets() {
             Some((o1, o2)) => src.slice(o1..o2),
             None => Err(crate::Error::RequiresContiguous { op: "index-select" }.bt())?,
@@ -446,7 +492,7 @@ impl Map1 for IndexSelect<'_> {
         let mut builder = func.builder();
         barg!(builder, dst_el);
         barg!(builder, ids_dims.len());
-        builder.arg(&ds);
+        builder.arg(ds.as_arg());
         barg!(builder, ids);
         builder.arg(&src);
         builder.arg(&out);
@@ -475,7 +521,7 @@ impl Map1 for Gather<'_> {
             Some(o12) => o12,
             None => Err(crate::Error::RequiresContiguous { op: "gather" }.bt())?,
         };
-        let (name, (ids, _guard)) = match &ids.slice {
+        let (name, (ids, _guard)) = match &*ids.slice {
             CudaStorageSlice::U32(slice) => ("gather_u32", slice_ptr(slice, ids_o1)),
             CudaStorageSlice::U8(slice) => ("gather_u8", slice_ptr(slice, ids_o1)),
             CudaStorageSlice::I64(slice) => ("gather_i64", slice_ptr(slice, ids_o1)),
@@ -530,7 +576,7 @@ impl Map2InPlace for IndexAdd<'_> {
             Some(o12) => o12,
             None => Err(crate::Error::RequiresContiguous { op: "index-add" }.bt())?,
         };
-        let (name, (ids, _guard)) = match &ids.slice {
+        let (name, (ids, _guard)) = match &*ids.slice {
             CudaStorageSlice::U32(slice) => ("ia_u32", slice_ptr(slice, ids_o1)),
             CudaStorageSlice::I64(slice) => ("ia_i64", slice_ptr(slice, ids_o1)),
             CudaStorageSlice::U8(slice) => ("ia_u8", slice_ptr(slice, ids_o1)),
@@ -584,7 +630,7 @@ impl Map2InPlace for Scatter<'_> {
             Some(o12) => o12,
             None => Err(crate::Error::RequiresContiguous { op: "scatter" }.bt())?,
         };
-        let (name, (ids, _guard)) = match &ids.slice {
+        let (name, (ids, _guard)) = match &*ids.slice {
             CudaStorageSlice::U32(slice) => ("s_u32", slice_ptr(slice, ids_o1)),
             CudaStorageSlice::I64(slice) => ("s_i64", slice_ptr(slice, ids_o1)),
             CudaStorageSlice::U8(slice) => ("s_u8", slice_ptr(slice, ids_o1)),
@@ -636,7 +682,7 @@ impl Map2InPlace for ScatterAdd<'_> {
             Some(o12) => o12,
             None => Err(crate::Error::RequiresContiguous { op: "scatter-add" }.bt())?,
         };
-        let (name, (ids, _guard)) = match &ids.slice {
+        let (name, (ids, _guard)) = match &*ids.slice {
             CudaStorageSlice::U32(slice) => ("sa_u32", slice_ptr(slice, ids_o1)),
             CudaStorageSlice::I64(slice) => ("sa_i64", slice_ptr(slice, ids_o1)),
             CudaStorageSlice::U8(slice) => ("sa_u8", slice_ptr(slice, ids_o1)),
@@ -702,10 +748,10 @@ impl Map2 for Conv1D<'_> {
         } else {
             crate::bail!("unexpected input shape for conv1d {dims:?}")
         };
-        let ds = dev.clone_htod(&ds)?;
+        let ds = dev.htod_info(&ds)?;
         let mut builder = func.builder();
         barg!(builder, el, l_out, p.stride, p.padding, p.dilation);
-        builder.arg(&ds);
+        builder.arg(ds.as_arg());
         builder.arg(inp);
         builder.arg(k);
         builder.arg(&out);
@@ -745,10 +791,10 @@ impl Map2 for Conv2D<'_> {
         } else {
             crate::bail!("unexpected input shape for conv2d {dims:?}")
         };
-        let ds = dev.clone_htod(&ds)?;
+        let ds = dev.htod_info(&ds)?;
         let mut builder = func.builder();
         barg!(builder, el, out_w, out_h, p.stride, p.padding, p.dilation);
-        builder.arg(&ds);
+        builder.arg(ds.as_arg());
         builder.arg(inp);
         builder.arg(k);
         builder.arg(&out);
@@ -816,7 +862,7 @@ impl Map2 for ConvTranspose1D<'_> {
         } else {
             crate::bail!("unexpected input shape for conv_transpose1d {dims:?}")
         };
-        let ds = dev.clone_htod(&ds)?;
+        let ds = dev.htod_info(&ds)?;
         let mut builder = func.builder();
         barg!(builder, el);
         barg!(builder, l_out);
@@ -824,7 +870,7 @@ impl Map2 for ConvTranspose1D<'_> {
         barg!(builder, p.padding);
         barg!(builder, p.output_padding);
         barg!(builder, p.dilation);
-        builder.arg(&ds);
+        builder.arg(ds.as_arg());
         builder.arg(inp);
         builder.arg(k);
         builder.arg(&out);
@@ -864,7 +910,7 @@ impl Map2 for ConvTranspose2D<'_> {
         } else {
             crate::bail!("unexpected input shape for conv_transpose2d {dims:?}")
         };
-        let ds = dev.clone_htod(&ds)?;
+        let ds = dev.htod_info(&ds)?;
         let mut builder = func.builder();
         barg!(builder, el);
         barg!(builder, out_w);
@@ -873,7 +919,7 @@ impl Map2 for ConvTranspose2D<'_> {
         barg!(builder, p.padding);
         barg!(builder, p.output_padding);
         barg!(builder, p.dilation);
-        builder.arg(&ds);
+        builder.arg(ds.as_arg());
         builder.arg(inp);
         builder.arg(k);
         builder.arg(&out);
@@ -924,14 +970,14 @@ impl Map1 for Pool2D {
         let func = dev.get_or_load_func(&kernel_name::<T>(kname), &kernels::CONV)?;
         // SAFETY: Set later by running the kernel.
         let out = unsafe { dev.alloc::<T>(dst_el)? };
-        let ds = dev.clone_htod(&ds)?;
+        let ds = dev.htod_info(&ds)?;
         let mut builder = func.builder();
         barg!(builder, el);
         barg!(builder, self.w_k);
         barg!(builder, self.h_k);
         barg!(builder, self.w_stride);
         barg!(builder, self.h_stride);
-        builder.arg(&ds);
+        builder.arg(ds.as_arg());
         builder.arg(inp);
         builder.arg(&out);
         // SAFETY: ffi.
@@ -963,7 +1009,7 @@ impl Map1 for UpsampleNearest2D {
         let func = dev.get_or_load_func(&kernel_name::<T>("upsample_nearest2d"), &kernels::CONV)?;
         // SAFETY: Set later by running the kernel.
         let out = unsafe { dev.alloc::<T>(dst_el)? };
-        let ds = dev.clone_htod(&ds)?;
+        let ds = dev.htod_info(&ds)?;
         let scale_w = dims[2] as f64 / out_w as f64;
         let scale_h = dims[3] as f64 / out_h as f64;
         let mut builder = func.builder();
@@ -971,7 +1017,7 @@ impl Map1 for UpsampleNearest2D {
         barg!(builder, out_h);
         barg!(builder, scale_w);
         barg!(builder, scale_h);
-        builder.arg(&ds);
+        builder.arg(ds.as_arg());
         builder.arg(inp);
         builder.arg(&out);
         // SAFETY: ffi.
@@ -1012,7 +1058,7 @@ impl Map1 for UpsampleBilinear2D {
 
         // SAFETY: Set later by running the kernel.
         let out = unsafe { dev.alloc::<T>(dst_el)? };
-        let ds = dev.clone_htod(&ds)?;
+        let ds = dev.htod_info(&ds)?;
 
         let mut builder = func.builder();
         barg!(builder, out_w);
@@ -1022,7 +1068,7 @@ impl Map1 for UpsampleBilinear2D {
         barg!(builder, self.scale_h_factor.unwrap_or(0.0));
         barg!(builder, self.scale_w_factor.is_some());
         barg!(builder, self.scale_w_factor.unwrap_or(0.0));
-        builder.arg(&ds);
+        builder.arg(ds.as_arg());
         builder.arg(inp);
         builder.arg(&out);
 
@@ -1043,7 +1089,7 @@ impl Map2 for WhereCond<'_> {
         dev: &CudaDevice,
     ) -> Result<CudaSlice<T>> {
         let ids_l = &self.1;
-        let ((ids, _guard), name) = match &self.0.slice {
+        let ((ids, _guard), name) = match &*self.0.slice {
             CudaStorageSlice::U8(slice) => {
                 let ptr = slice_ptr(slice, ids_l.start_offset());
                 (ptr, "where_u8")
@@ -1068,7 +1114,7 @@ impl Map2 for WhereCond<'_> {
         let el = shape.elem_count();
         let cfg = LaunchConfig::for_num_elems(el as u32);
         let ds =
-            dev.clone_htod(&[dims, ids_l.stride(), layout_t.stride(), layout_f.stride()].concat())?;
+            dev.htod_info(&[dims, ids_l.stride(), layout_t.stride(), layout_f.stride()].concat())?;
         let t = &t.slice(layout_t.start_offset()..);
         let f = &f.slice(layout_f.start_offset()..);
         let func = dev.get_or_load_func(&kernel_name::<T>(name), &kernels::TERNARY)?;
@@ -1077,7 +1123,7 @@ impl Map2 for WhereCond<'_> {
         let mut builder = func.builder();
         barg!(builder, el);
         barg!(builder, dims.len());
-        builder.arg(&ds);
+        builder.arg(ds.as_arg());
         barg!(builder, ids);
         builder.arg(t);
         builder.arg(f);
@@ -1104,7 +1150,7 @@ impl<U: crate::op::BinaryOpT> Map2 for U {
         let dims_and_strides = if lhs_l.is_contiguous() && rhs_l.is_contiguous() {
             SlicePtrOrNull::Null
         } else {
-            SlicePtrOrNull::Ptr(dev.clone_htod(&[dims, lhs_l.stride(), rhs_l.stride()].concat())?)
+            SlicePtrOrNull::Ptr(dev.htod_info(&[dims, lhs_l.stride(), rhs_l.stride()].concat())?)
         };
         let lhs = &lhs.slice(lhs_l.start_offset()..);
         let rhs = &rhs.slice(rhs_l.start_offset()..);
@@ -1141,7 +1187,7 @@ impl Map2Any for Cmp {
         let dims_and_strides = if lhs_l.is_contiguous() && rhs_l.is_contiguous() {
             SlicePtrOrNull::Null
         } else {
-            SlicePtrOrNull::Ptr(dev.clone_htod(&[dims, lhs_l.stride(), rhs_l.stride()].concat())?)
+            SlicePtrOrNull::Ptr(dev.htod_info(&[dims, lhs_l.stride(), rhs_l.stride()].concat())?)
         };
         let lhs = &lhs.slice(lhs_l.start_offset()..);
         let rhs = &rhs.slice(rhs_l.start_offset()..);
@@ -1190,8 +1236,51 @@ fn slice_src_and_dst<'a, T>(
 
 #[derive(Debug)]
 pub struct CudaStorage {
-    pub slice: CudaStorageSlice,
+    // ManuallyDrop so our `Drop` can return the buffer to the device's opt-in
+    // caching allocator (graph-capture safety, RUN-161) instead of freeing.
+    // When caching is OFF (default), Drop frees it -> identical to upstream.
+    pub slice: std::mem::ManuallyDrop<CudaStorageSlice>,
     pub device: CudaDevice,
+}
+
+impl CudaStorageSlice {
+    /// Consume the slice, returning (byte_len, raw_ptr) and leaking the memory
+    /// (no free). Used by `CudaStorage::drop` to hand the buffer to the cache.
+    fn byte_len_and_leak(self) -> (usize, cudarc::driver::sys::CUdeviceptr) {
+        match self {
+            CudaStorageSlice::U8(s) => (s.len(), s.leak()),
+            CudaStorageSlice::U32(s) => (s.len() * 4, s.leak()),
+            CudaStorageSlice::I16(s) => (s.len() * 2, s.leak()),
+            CudaStorageSlice::I32(s) => (s.len() * 4, s.leak()),
+            CudaStorageSlice::I64(s) => (s.len() * 8, s.leak()),
+            CudaStorageSlice::BF16(s) => (s.len() * 2, s.leak()),
+            CudaStorageSlice::F16(s) => (s.len() * 2, s.leak()),
+            CudaStorageSlice::F32(s) => (s.len() * 4, s.leak()),
+            CudaStorageSlice::F64(s) => (s.len() * 8, s.leak()),
+            CudaStorageSlice::F8E4M3(s) => (s.len(), s.leak()),
+            CudaStorageSlice::F6E2M3(s) => (s.len(), s.leak()),
+            CudaStorageSlice::F6E3M2(s) => (s.len(), s.leak()),
+            CudaStorageSlice::F4(s) => (s.len(), s.leak()),
+            CudaStorageSlice::F8E8M0(s) => (s.len(), s.leak()),
+        }
+    }
+}
+
+impl Drop for CudaStorage {
+    fn drop(&mut self) {
+        if !self.device.alloc_cache_enabled() {
+            // Default path: free normally (byte-identical to upstream candle).
+            unsafe { std::mem::ManuallyDrop::drop(&mut self.slice) };
+            return;
+        }
+        // Caching ON: return the buffer to the device cache instead of freeing.
+        let slice = unsafe { std::mem::ManuallyDrop::take(&mut self.slice) };
+        let (bytes, ptr) = slice.byte_len_and_leak();
+        if !self.device.cache_put(bytes, ptr) {
+            // Caching toggled off between the check and here; free the ptr.
+            drop(unsafe { self.device.cuda_stream_ref().upgrade_device_ptr::<u8>(ptr, 0) });
+        }
+    }
 }
 
 pub trait CudaDType: Sized {
@@ -1204,7 +1293,7 @@ macro_rules! cuda_dtype {
     ($ty:ty, $dtype:ident) => {
         impl CudaDType for $ty {
             fn as_cuda_slice(s: &CudaStorage) -> Result<&CudaSlice<Self>> {
-                match &s.slice {
+                match &*s.slice {
                     CudaStorageSlice::$dtype(data) => Ok(&data),
                     _ => Err(crate::Error::UnexpectedDType {
                         expected: DType::$dtype,
@@ -1216,11 +1305,12 @@ macro_rules! cuda_dtype {
             }
 
             fn as_cuda_slice_mut(s: &mut CudaStorage) -> Result<&mut CudaSlice<Self>> {
-                match s.slice {
-                    CudaStorageSlice::$dtype(ref mut data) => Ok(data),
+                let got = s.dtype();
+                match &mut *s.slice {
+                    CudaStorageSlice::$dtype(data) => Ok(data),
                     _ => Err(crate::Error::UnexpectedDType {
                         expected: DType::$dtype,
-                        got: s.dtype(),
+                        got,
                         msg: "unexpected dtype",
                     }
                     .bt()),
@@ -1229,7 +1319,10 @@ macro_rules! cuda_dtype {
 
             fn wrap_cuda_slice(slice: CudaSlice<Self>, device: CudaDevice) -> CudaStorage {
                 let slice = CudaStorageSlice::$dtype(slice);
-                CudaStorage { slice, device }
+                CudaStorage {
+                    slice: std::mem::ManuallyDrop::new(slice),
+                    device,
+                }
             }
         }
     };
@@ -1334,7 +1427,7 @@ impl CudaStorage {
         };
 
         Ok(Self {
-            slice: storage_slice,
+            slice: std::mem::ManuallyDrop::new(storage_slice),
             device: dst.clone(),
         })
     }
@@ -1436,13 +1529,13 @@ impl BackendStorage for CudaStorage {
     type Device = CudaDevice;
 
     fn try_clone(&self, layout: &Layout) -> Result<Self> {
-        let slice = Clone.map(&self.slice, self.device(), layout)?;
+        let slice = Clone.map(&*self.slice, self.device(), layout)?;
         let device = self.device.clone();
-        Ok(Self { slice, device })
+        Ok(Self { slice: std::mem::ManuallyDrop::new(slice), device })
     }
 
     fn dtype(&self) -> DType {
-        match self.slice {
+        match &*self.slice {
             CudaStorageSlice::U8(_) => DType::U8,
             CudaStorageSlice::U32(_) => DType::U32,
             CudaStorageSlice::I16(_) => DType::I16,
@@ -1472,7 +1565,7 @@ impl BackendStorage for CudaStorage {
         let cfg = LaunchConfig::for_num_elems(el_count as u32);
         let ds = SlicePtrOrNull::params_from_layout(dev, layout)?;
         let src_o = layout.start_offset();
-        let ((src, _guard_src), kernel_name) = match &mut self.slice {
+        let ((src, _guard_src), kernel_name) = match &mut *self.slice {
             S::U8(s) => (slice_ptr(s, src_o), "const_set_u8"),
             S::U32(s) => (slice_ptr(s, src_o), "const_set_u32"),
             S::I16(s) => (slice_ptr(s, src_o), "const_set_i16"),
@@ -1515,7 +1608,7 @@ impl BackendStorage for CudaStorage {
         // This returns an i64 rather than a &i64, this is useful to get around some temporary
         // lifetime issue and is safe as long as self.slice does not go out of scope before inp
         // is used.
-        let (inp, _guard) = match &self.slice {
+        let (inp, _guard) = match &*self.slice {
             CudaStorageSlice::U8(inp) => slice_ptr(inp, start_o),
             CudaStorageSlice::U32(inp) => slice_ptr(inp, start_o),
             CudaStorageSlice::I16(inp) => slice_ptr(inp, start_o),
@@ -1640,45 +1733,45 @@ impl BackendStorage for CudaStorage {
             }
         };
         Ok(Self {
-            slice,
+            slice: std::mem::ManuallyDrop::new(slice),
             device: dev.clone(),
         })
     }
 
     fn affine(&self, layout: &Layout, mul: f64, add: f64) -> Result<Self> {
         let device = self.device().clone();
-        let slice = Affine(mul, add).map(&self.slice, &device, layout)?;
-        Ok(Self { slice, device })
+        let slice = Affine(mul, add).map(&*self.slice, &device, layout)?;
+        Ok(Self { slice: std::mem::ManuallyDrop::new(slice), device })
     }
 
     fn powf(&self, layout: &Layout, e: f64) -> Result<Self> {
         let device = self.device().clone();
-        let slice = Powf(e).map(&self.slice, &device, layout)?;
-        Ok(Self { slice, device })
+        let slice = Powf(e).map(&*self.slice, &device, layout)?;
+        Ok(Self { slice: std::mem::ManuallyDrop::new(slice), device })
     }
 
     fn elu(&self, layout: &Layout, alpha: f64) -> Result<Self> {
         let device = self.device().clone();
-        let slice = Elu(alpha).map(&self.slice, &device, layout)?;
-        Ok(Self { slice, device })
+        let slice = Elu(alpha).map(&*self.slice, &device, layout)?;
+        Ok(Self { slice: std::mem::ManuallyDrop::new(slice), device })
     }
 
     fn reduce_op(&self, op: ReduceOp, layout: &Layout, sum_dims: &[usize]) -> Result<Self> {
         let device = self.device().clone();
-        let slice = FastReduce(sum_dims, op).map(&self.slice, &device, layout)?;
-        Ok(Self { slice, device })
+        let slice = FastReduce(sum_dims, op).map(&*self.slice, &device, layout)?;
+        Ok(Self { slice: std::mem::ManuallyDrop::new(slice), device })
     }
 
     fn cmp(&self, op: CmpOp, rhs: &Self, lhs_l: &Layout, rhs_l: &Layout) -> Result<Self> {
         let device = self.device().clone();
-        let slice = Cmp(op).map(&self.slice, lhs_l, &rhs.slice, rhs_l, &device)?;
-        Ok(Self { slice, device })
+        let slice = Cmp(op).map(&*self.slice, lhs_l, &*rhs.slice, rhs_l, &device)?;
+        Ok(Self { slice: std::mem::ManuallyDrop::new(slice), device })
     }
 
     fn unary_impl<U: UnaryOpT>(&self, layout: &Layout) -> Result<Self> {
         let device = self.device().clone();
-        let slice = U::V.map(&self.slice, &device, layout)?;
-        Ok(Self { slice, device })
+        let slice = U::V.map(&*self.slice, &device, layout)?;
+        Ok(Self { slice: std::mem::ManuallyDrop::new(slice), device })
     }
 
     fn binary_impl<B: BinaryOpT>(
@@ -1688,12 +1781,12 @@ impl BackendStorage for CudaStorage {
         rhs_l: &Layout,
     ) -> Result<Self> {
         let device = self.device().clone();
-        let slice = B::V.map(&self.slice, lhs_l, &rhs.slice, rhs_l, &device)?;
-        Ok(Self { slice, device })
+        let slice = B::V.map(&*self.slice, lhs_l, &*rhs.slice, rhs_l, &device)?;
+        Ok(Self { slice: std::mem::ManuallyDrop::new(slice), device })
     }
 
     fn to_cpu_storage(&self) -> Result<CpuStorage> {
-        match &self.slice {
+        match &*self.slice {
             CudaStorageSlice::U8(slice) => {
                 let cpu_storage = slice.stream().clone_dtoh(slice).w()?;
                 Ok(CpuStorage::U8(cpu_storage))
@@ -1754,8 +1847,8 @@ impl BackendStorage for CudaStorage {
         f_l: &Layout,
     ) -> Result<Self> {
         let device = self.device().clone();
-        let slice = WhereCond(self, layout).map(&t.slice, t_l, &f.slice, f_l, &device)?;
-        Ok(Self { slice, device })
+        let slice = WhereCond(self, layout).map(&*t.slice, t_l, &*f.slice, f_l, &device)?;
+        Ok(Self { slice: std::mem::ManuallyDrop::new(slice), device })
     }
 
     #[cfg(not(feature = "cudnn"))]
@@ -1770,8 +1863,8 @@ impl BackendStorage for CudaStorage {
 
         let device = self.device().clone();
         if !USE_IM2COL_CONV1D {
-            let slice = Conv1D(params).map(&self.slice, l, &kernel.slice, kernel_l, &device)?;
-            return Ok(Self { slice, device });
+            let slice = Conv1D(params).map(&*self.slice, l, &*kernel.slice, kernel_l, &device)?;
+            return Ok(Self { slice: std::mem::ManuallyDrop::new(slice), device });
         }
 
         let col = Im2Col1D {
@@ -1780,8 +1873,8 @@ impl BackendStorage for CudaStorage {
             dilation: params.dilation,
             padding: params.padding,
         }
-        .map(&self.slice, &device, l)?;
-        let col = Self { slice: col, device };
+        .map(&*self.slice, &device, l)?;
+        let col = Self { slice: std::mem::ManuallyDrop::new(col), device };
         let l_out = params.l_out();
         let b = params.b_size;
         let n = params.c_out;
@@ -1819,12 +1912,12 @@ impl BackendStorage for CudaStorage {
     ) -> Result<Self> {
         let device = self.device().clone();
         if !kernel_l.is_contiguous() {
-            let slice = Conv1D(params).map(&self.slice, inp_l, &kernel.slice, kernel_l, &device)?;
-            return Ok(Self { slice, device });
+            let slice = Conv1D(params).map(&*self.slice, inp_l, &*kernel.slice, kernel_l, &device)?;
+            return Ok(Self { slice: std::mem::ManuallyDrop::new(slice), device });
         }
         let l_out = params.l_out();
         let dst_el = params.c_out * l_out * params.b_size;
-        let slice = match (&self.slice, &kernel.slice) {
+        let slice = match (&*self.slice, &*kernel.slice) {
             (S::U8(inp), S::U8(k)) => {
                 let inp = &inp.slice(inp_l.start_offset()..);
                 let k = &k.slice(kernel_l.start_offset()..);
@@ -1877,7 +1970,7 @@ impl BackendStorage for CudaStorage {
             }
             _ => Err(CudaError::InternalError("dtype mismatch in conv1d"))?,
         };
-        Ok(Self { slice, device })
+        Ok(Self { slice: std::mem::ManuallyDrop::new(slice), device })
     }
 
     fn conv_transpose1d(
@@ -1932,11 +2025,11 @@ impl BackendStorage for CudaStorage {
             Col2Im1D {
                 stride: params.stride,
             }
-            .map(&col.slice, &device, &col_l)?
+            .map(&*col.slice, &device, &col_l)?
         } else {
-            ConvTranspose1D(params).map(&self.slice, l, &kernel.slice, kernel_l, &device)?
+            ConvTranspose1D(params).map(&*self.slice, l, &*kernel.slice, kernel_l, &device)?
         };
-        Ok(Self { slice, device })
+        Ok(Self { slice: std::mem::ManuallyDrop::new(slice), device })
     }
 
     #[cfg(not(feature = "cudnn"))]
@@ -1951,8 +2044,8 @@ impl BackendStorage for CudaStorage {
 
         let device = self.device().clone();
         if !USE_IM2COL_CONV2D {
-            let slice = Conv2D(params).map(&self.slice, l, &kernel.slice, kernel_l, &device)?;
-            return Ok(Self { slice, device });
+            let slice = Conv2D(params).map(&*self.slice, l, &*kernel.slice, kernel_l, &device)?;
+            return Ok(Self { slice: std::mem::ManuallyDrop::new(slice), device });
         }
 
         let col = Im2Col {
@@ -1962,8 +2055,8 @@ impl BackendStorage for CudaStorage {
             dilation: params.dilation,
             padding: params.padding,
         }
-        .map(&self.slice, &device, l)?;
-        let col = Self { slice: col, device };
+        .map(&*self.slice, &device, l)?;
+        let col = Self { slice: std::mem::ManuallyDrop::new(col), device };
         let h_out = params.out_h();
         let w_out = params.out_w();
         let b = params.b_size;
@@ -2004,12 +2097,12 @@ impl BackendStorage for CudaStorage {
     ) -> Result<Self> {
         let device = self.device().clone();
         if !kernel_l.is_contiguous() {
-            let slice = Conv2D(params).map(&self.slice, inp_l, &kernel.slice, kernel_l, &device)?;
-            return Ok(Self { slice, device });
+            let slice = Conv2D(params).map(&*self.slice, inp_l, &*kernel.slice, kernel_l, &device)?;
+            return Ok(Self { slice: std::mem::ManuallyDrop::new(slice), device });
         }
         let (out_w, out_h) = (params.out_w(), params.out_h());
         let dst_el = params.c_out * out_w * out_h * params.b_size;
-        let slice = match (&self.slice, &kernel.slice) {
+        let slice = match (&*self.slice, &*kernel.slice) {
             (S::U8(inp), S::U8(k)) => {
                 let inp = &inp.slice(inp_l.start_offset()..);
                 let k = &k.slice(kernel_l.start_offset()..);
@@ -2062,7 +2155,7 @@ impl BackendStorage for CudaStorage {
             }
             _ => Err(CudaError::InternalError("dtype mismatch in conv2d"))?,
         };
-        Ok(Self { slice, device })
+        Ok(Self { slice: std::mem::ManuallyDrop::new(slice), device })
     }
 
     fn conv_transpose2d(
@@ -2074,8 +2167,8 @@ impl BackendStorage for CudaStorage {
     ) -> Result<Self> {
         let device = self.device().clone();
         let slice =
-            ConvTranspose2D(params).map(&self.slice, l, &kernel.slice, kernel_l, &device)?;
-        Ok(Self { slice, device })
+            ConvTranspose2D(params).map(&*self.slice, l, &*kernel.slice, kernel_l, &device)?;
+        Ok(Self { slice: std::mem::ManuallyDrop::new(slice), device })
     }
 
     fn avg_pool2d(&self, l: &Layout, k: (usize, usize), stride: (usize, usize)) -> Result<Self> {
@@ -2087,8 +2180,8 @@ impl BackendStorage for CudaStorage {
             h_stride: stride.1,
             op: PoolOp::Avg,
         }
-        .map(&self.slice, &device, l)?;
-        Ok(Self { slice, device })
+        .map(&*self.slice, &device, l)?;
+        Ok(Self { slice: std::mem::ManuallyDrop::new(slice), device })
     }
 
     fn max_pool2d(&self, l: &Layout, k: (usize, usize), stride: (usize, usize)) -> Result<Self> {
@@ -2100,8 +2193,8 @@ impl BackendStorage for CudaStorage {
             h_stride: stride.1,
             op: PoolOp::Max,
         }
-        .map(&self.slice, &device, l)?;
-        Ok(Self { slice, device })
+        .map(&*self.slice, &device, l)?;
+        Ok(Self { slice: std::mem::ManuallyDrop::new(slice), device })
     }
 
     fn upsample_nearest1d(&self, _: &Layout, _out_sz: usize) -> Result<Self> {
@@ -2110,8 +2203,8 @@ impl BackendStorage for CudaStorage {
 
     fn upsample_nearest2d(&self, l: &Layout, out_w: usize, out_h: usize) -> Result<Self> {
         let device = self.device().clone();
-        let slice = UpsampleNearest2D(out_w, out_h).map(&self.slice, &device, l)?;
-        Ok(Self { slice, device })
+        let slice = UpsampleNearest2D(out_w, out_h).map(&*self.slice, &device, l)?;
+        Ok(Self { slice: std::mem::ManuallyDrop::new(slice), device })
     }
 
     fn upsample_bilinear2d(
@@ -2131,19 +2224,19 @@ impl BackendStorage for CudaStorage {
             scale_h_factor: scale_h,
             scale_w_factor: scale_w,
         }
-        .map(&self.slice, &device, l)?;
-        Ok(Self { slice, device })
+        .map(&*self.slice, &device, l)?;
+        Ok(Self { slice: std::mem::ManuallyDrop::new(slice), device })
     }
 
     fn index_select(&self, ids: &Self, l: &Layout, ids_l: &Layout, dim: usize) -> Result<Self> {
         let device = self.device().clone();
-        let slice = IndexSelect(ids, ids_l, dim).map(&self.slice, &device, l)?;
-        Ok(Self { slice, device })
+        let slice = IndexSelect(ids, ids_l, dim).map(&*self.slice, &device, l)?;
+        Ok(Self { slice: std::mem::ManuallyDrop::new(slice), device })
     }
     fn gather(&self, l: &Layout, ids: &Self, ids_l: &Layout, dim: usize) -> Result<Self> {
         let device = self.device().clone();
-        let slice = Gather(ids, ids_l, dim).map(&self.slice, &device, l)?;
-        Ok(Self { slice, device })
+        let slice = Gather(ids, ids_l, dim).map(&*self.slice, &device, l)?;
+        Ok(Self { slice: std::mem::ManuallyDrop::new(slice), device })
     }
     fn scatter_set(
         &mut self,
@@ -2155,7 +2248,7 @@ impl BackendStorage for CudaStorage {
         dim: usize,
     ) -> Result<()> {
         let device = self.device().clone();
-        Scatter(ids, ids_l, dim).map(&mut self.slice, l, &src.slice, src_l, &device)
+        Scatter(ids, ids_l, dim).map(&mut *self.slice, l, &*src.slice, src_l, &device)
     }
     fn scatter_add_set(
         &mut self,
@@ -2167,7 +2260,7 @@ impl BackendStorage for CudaStorage {
         dim: usize,
     ) -> Result<()> {
         let device = self.device().clone();
-        ScatterAdd(ids, ids_l, dim).map(&mut self.slice, l, &src.slice, src_l, &device)
+        ScatterAdd(ids, ids_l, dim).map(&mut *self.slice, l, &*src.slice, src_l, &device)
     }
     fn index_add(
         &self,
@@ -2181,7 +2274,7 @@ impl BackendStorage for CudaStorage {
         let device = self.device().clone();
         let mut acc = unsafe { device.alloc_uninit(l.shape(), self.dtype())? };
         self.copy_strided_src(&mut acc, 0, l)?;
-        IndexAdd(ids, ids_l, dim).map(&mut acc.slice, l, &src.slice, src_l, &device)?;
+        IndexAdd(ids, ids_l, dim).map(&mut *acc.slice, l, &*src.slice, src_l, &device)?;
         Ok(acc)
     }
 
@@ -2194,7 +2287,7 @@ impl BackendStorage for CudaStorage {
     ) -> Result<Self> {
         let elem_count = b * m * n;
         let dev = &self.device;
-        let slice = match (&self.slice, &rhs.slice) {
+        let slice = match (&*self.slice, &*rhs.slice) {
             (CudaStorageSlice::BF16(lhs), CudaStorageSlice::BF16(rhs)) => {
                 let lhs = &lhs.slice(lhs_l.start_offset()..);
                 let rhs = &rhs.slice(rhs_l.start_offset()..);
@@ -2238,7 +2331,7 @@ impl BackendStorage for CudaStorage {
             _ => Err(CudaError::InternalError("dtype mismatch in matmul op"))?,
         };
         let device = dev.clone();
-        Ok(Self { slice, device })
+        Ok(Self { slice: std::mem::ManuallyDrop::new(slice), device })
     }
 
     fn copy2d(
@@ -2261,7 +2354,7 @@ impl BackendStorage for CudaStorage {
         }
         let dst_s = dst_s as u32;
         let src_s = src_s as u32;
-        let ((src, _guard_src), (dst, _guard_dst), kname) = match (&self.slice, &mut dst.slice) {
+        let ((src, _guard_src), (dst, _guard_dst), kname) = match (&*self.slice, &mut *dst.slice) {
             (S::U8(s), S::U8(d)) => (slice_ptr(s, src_o), slice_ptr(d, dst_o), "copy2d_u8"),
             (S::U32(s), S::U32(d)) => (slice_ptr(s, src_o), slice_ptr(d, dst_o), "copy2d_u32"),
             (S::I16(s), S::I16(d)) => (slice_ptr(s, src_o), slice_ptr(d, dst_o), "copy2d_i16"),
@@ -2299,7 +2392,7 @@ impl BackendStorage for CudaStorage {
         let cfg = LaunchConfig::for_num_elems(el_count as u32);
         let dev = &self.device;
         let ds = SlicePtrOrNull::params_from_layout(dev, src_l)?;
-        match (&self.slice, &mut dst.slice) {
+        match (&*self.slice, &mut *dst.slice) {
             (CudaStorageSlice::BF16(src), CudaStorageSlice::BF16(dst)) => {
                 let (src, mut dst) = slice_src_and_dst(src, src_l, dst, dst_offset);
                 if src_l.is_contiguous() {
