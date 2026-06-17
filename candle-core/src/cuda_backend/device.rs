@@ -113,6 +113,14 @@ impl CudaDevice {
     ///    `set_capture_mode(false)` -- every alloc is now a cache hit at a stable
     ///    address, every free is deferred -> no graph memory nodes, no aliasing.
     pub fn set_capture_mode(&self, capturing: bool) {
+        // RUN-161: ARC_NO_DEFERRED_FREE makes this a no-op -> buffers freed during
+        // capture are recycled normally (within-capture reuse). Tests whether
+        // single-stream recycling is capture-safe (it should be: a buffer is only
+        // freed after its last use is submitted = stream-ordered). If so we drop
+        // deferred-free entirely -> peak memory = normal forward peak (fits 80GB).
+        if std::env::var_os("ARC_NO_DEFERRED_FREE").is_some() {
+            return;
+        }
         let mut cache = self.alloc_cache.lock().unwrap();
         cache.capturing = capturing;
         if !capturing {
