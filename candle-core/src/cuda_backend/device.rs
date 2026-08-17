@@ -112,6 +112,60 @@ impl CudaDevice {
     /// 4. `set_capture_mode(true)`; begin_capture; forward; end_capture;
     ///    `set_capture_mode(false)` -- every alloc is now a cache hit at a stable
     ///    address, every free is deferred -> no graph memory nodes, no aliasing.
+    /// Free EVERY cached buffer immediately, while the pool they were allocated
+    /// from is still alive.
+    ///
+    /// # Why this exists (RUN-161 heap corruption)
+    ///
+    /// `AllocCache` stores `(bytes, ptr)` and **nothing about which memory pool
+    /// a pointer came from**. It is device-global and lives for the process.
+    /// Arc's CUDA-graph capture installs a *private* pool as the device default
+    /// for the duration of a capture (`cuDeviceSetMemPool`), so every allocation
+    /// that misses the cache during capture is served **from that private pool**
+    /// — and is then parked in this cache when it is freed.
+    ///
+    /// When the private pool is destroyed, those cached pointers dangle. The
+    /// cache keeps handing them out; `cuMemFreeAsync` is eventually called on a
+    /// pointer whose pool no longer exists. `cuMemPoolDestroy` with outstanding
+    /// allocations is undefined behaviour, and freeing into a destroyed pool
+    /// corrupts the driver's host-side bookkeeping — which lives in the
+    /// process's glibc arena. Measured symptom: `corrupted double-linked list`
+    /// and `malloc_consolidate(): invalid chunk size`, at an arbitrary later
+    /// allocation, only ever in capture-enabled runs.
+    ///
+    /// # Why it drains `free` as well as `deferred`
+    ///
+    /// Draining only `deferred` is not enough. A buffer still LIVE at capture
+    /// end — the captured graph's own output tensor is the obvious one — is
+    /// dropped later, when `capturing` is already false, so it lands in `free`.
+    /// Both lists can therefore hold private-pool pointers, and without pool
+    /// provenance the only sound answer is to drain both.
+    ///
+    /// # Caller contract
+    ///
+    /// Call this **before** `cuMemPoolDestroy`, and only when no captured graph
+    /// may still replay — a live graph's baked addresses are exactly these
+    /// buffers, so freeing them under a replayable graph trades one
+    /// use-after-free for another. Destroy the `CUgraphExec` first, then drain,
+    /// then destroy the pool.
+    ///
+    /// Cost is one cold warmup: the cache simply refills.
+    pub fn drain_alloc_cache_and_free(&self) {
+        let drained: Vec<cudarc::driver::sys::CUdeviceptr> = {
+            let mut cache = self.alloc_cache.lock().unwrap();
+            cache.capturing = false;
+            let mut d: Vec<_> = cache.free.drain().flat_map(|(_, v)| v).collect();
+            d.extend(cache.deferred.drain(..).map(|(_, p)| p));
+            // Sizes that missed before mean nothing once every buffer is gone.
+            cache.missed.clear();
+            d
+        };
+        // Free outside the lock (upgrade -> Drop frees via cudarc).
+        for ptr in drained {
+            drop(unsafe { self.stream.upgrade_device_ptr::<u8>(ptr, 0) });
+        }
+    }
+
     pub fn set_capture_mode(&self, capturing: bool) {
         // RUN-161: ARC_NO_DEFERRED_FREE makes this a no-op -> buffers freed during
         // capture are recycled normally (within-capture reuse). Tests whether
