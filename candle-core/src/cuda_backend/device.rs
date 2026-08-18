@@ -162,9 +162,37 @@ fn bucket(bytes: usize) -> usize {
     bytes.div_ceil(gran) * gran
 }
 
+/// Round an allocation DOWN to a reuse bucket, for filing a buffer whose
+/// physical size we did not choose.
+///
+/// # Why put() cannot use `bucket()`
+///
+/// `bucket()` rounds UP, which is right for a REQUEST: ask for n, get a bucket
+/// >= n. It is catastrophic for a PUT of a buffer we did not allocate. Buffers
+/// created before the arena was switched on are allocated at their EXACT size;
+/// when they are freed afterwards, filing them under `bucket(exact)` advertises
+/// them as larger than they are, and the next request that lands in that bucket
+/// gets a short buffer. Measured symptom on an H200: decode survives, then
+/// prefill dies with CUDA_ERROR_INVALID_VALUE on the first larger allocation.
+///
+/// Filing under `bucket_down(P) <= P` restores the invariant that matters:
+/// a request R is served from key k = bucket(R) >= R, and any buffer filed
+/// under k has physical P >= bucket_down(P) = k >= R. Buffers the arena itself
+/// allocated are already on a bucket boundary, so they file unchanged and
+/// steady-state reuse is not affected.
+fn bucket_down(bytes: usize) -> usize {
+    const MIN: usize = 128;
+    if bytes < MIN {
+        return 0; // too small to file safely; caller frees it normally
+    }
+    let floor_pow2 = 1usize << (usize::BITS - 1 - bytes.leading_zeros());
+    let gran = (floor_pow2 >> 3).max(MIN);
+    (bytes / gran) * gran
+}
+
 #[cfg(test)]
 mod bucket_tests {
-    use super::bucket;
+    use super::{bucket, bucket_down};
 
     #[test]
     fn bucket_never_shrinks_a_request() {
@@ -207,6 +235,46 @@ mod bucket_tests {
                 b <= n + n / 8 + 128,
                 "bucket({n}) = {b} wastes more than 12.5%"
             );
+        }
+    }
+
+
+    #[test]
+    fn bucket_down_never_exceeds_the_buffer() {
+        // The invariant a put relies on: the key must not claim more than the
+        // buffer physically holds.
+        for n in 128usize..200_000 {
+            assert!(bucket_down(n) <= n, "bucket_down({n}) = {} > {n}", bucket_down(n));
+        }
+    }
+
+    #[test]
+    fn a_request_never_outgrows_the_buffer_it_is_served() {
+        // The end-to-end safety property, stated exactly as the allocator uses
+        // it: request R takes key bucket(R); a buffer of physical P sits under
+        // key bucket_down(P); if those keys match then R must fit in P.
+        // This is the property whose violation killed prefill with
+        // CUDA_ERROR_INVALID_VALUE.
+        for p in (128usize..300_000).step_by(7) {
+            let key = bucket_down(p);
+            if key == 0 {
+                continue;
+            }
+            for r in [key, key.saturating_sub(1), key / 2 + 1] {
+                if r > 0 && bucket(r) == key {
+                    assert!(r <= p, "request {r} served from a {p}-byte buffer under key {key}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn arena_allocated_sizes_file_unchanged() {
+        // Buffers the arena allocated are already on a boundary, so bucketing
+        // costs no reuse in steady state.
+        for n in [200usize, 1000, 4096, 1 << 16, (1 << 20) + 5] {
+            let b = bucket(n);
+            assert_eq!(bucket_down(b), b, "arena-allocated {b} did not file unchanged");
         }
     }
 
@@ -469,7 +537,12 @@ impl CudaDevice {
         if !cache.enabled {
             return false;
         }
-        let bytes = bucket(bytes);
+        // DOWN, not up: see `bucket_down`. Rounding a put up advertises a
+        // buffer as larger than it physically is.
+        let bytes = bucket_down(bytes);
+        if bytes == 0 {
+            return false;
+        }
         // Bounded by construction: refuse rather than grow past the cap. The
         // caller then frees normally, so the arena's footprint is the cap and
         // `cache_puts_refused` says whether the cap ever bound.
