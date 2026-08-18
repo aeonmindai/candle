@@ -553,7 +553,11 @@ impl CudaDevice {
         }
         let b = bucket(bytes);
         self.count_driver_alloc(b);
-        let raw = self.stream.alloc::<u8>(b).w()?;
+        // SAFETY: same contract as `CudaDevice::alloc` -- the bytes are
+        // uninitialised and every caller writes before it reads. Allocated as
+        // `u8` at the BUCKET size so the buffer physically holds what its
+        // free-list key claims.
+        let raw = unsafe { self.stream.alloc::<u8>(b) }.w()?;
         Ok(Some(raw.leak()))
     }
 
