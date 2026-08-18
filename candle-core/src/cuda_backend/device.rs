@@ -391,6 +391,11 @@ impl CudaDevice {
             d.extend(cache.deferred.drain(..).map(|(_, p)| p));
             // Sizes that missed before mean nothing once every buffer is gone.
             cache.missed.clear();
+            // The pools are empty, so the running byte total must say so --
+            // otherwise `verify_alloc_accounting` reports a mismatch that is
+            // this function's bookkeeping rather than a real one.
+            cache.stats.cached_bytes = 0;
+            cache.stats.driver_frees += d.len() as u64;
             d
         };
         // Free outside the lock (upgrade -> Drop frees via cudarc).
