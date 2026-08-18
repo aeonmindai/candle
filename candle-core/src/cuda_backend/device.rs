@@ -507,13 +507,15 @@ impl CudaDevice {
         if cache.intern_max_entries == 0 || cache.intern.len() >= cache.intern_max_entries {
             return false;
         }
-        if cache.intern.insert(key.into(), ptr).is_some() {
-            // Raced with another thread that interned the same layout; the
-            // previous pointer is now unreachable. Keep the new one and let the
-            // old one leak rather than free a buffer a kernel may be reading.
-            // Bounded by the table cap and only reachable under contention.
-            return true;
+        // Losing a race must not orphan a buffer. Overwriting the entry would
+        // make the winner's pointer unreachable -- never freed, never reused --
+        // so if the layout is already interned we decline and the caller keeps
+        // its own buffer, which its Drop returns to the arena. Both buffers
+        // hold the same bytes, so which one the kernel reads is immaterial.
+        if cache.intern.contains_key(key) {
+            return false;
         }
+        cache.intern.insert(key.into(), ptr);
         cache.intern_bytes += (key.len() * std::mem::size_of::<usize>()) as u64;
         true
     }
