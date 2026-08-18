@@ -16,7 +16,7 @@ pub mod cudnn;
 mod device;
 mod error;
 mod utils;
-pub use device::{CudaDevice, DeviceId};
+pub use device::{AllocAccounting, AllocStats, CudaDevice, DeviceId};
 pub use error::{CudaError, WrapErr};
 pub use utils::{Map1, Map1Any, Map2, Map2Any, Map2InPlace, Map3, S};
 
@@ -72,6 +72,10 @@ impl SlicePtrOrNull<usize> {
 pub struct InfoBuf<T> {
     slice: std::mem::ManuallyDrop<CudaSlice<T>>,
     device: CudaDevice,
+    /// This buffer is owned by the device's layout-intern table, not by this
+    /// handle. Drop must neither free it nor return it to the allocator cache:
+    /// the table will hand the same pointer out again.
+    interned: bool,
 }
 
 impl<T> InfoBuf<T> {
@@ -79,6 +83,15 @@ impl<T> InfoBuf<T> {
         Self {
             slice: std::mem::ManuallyDrop::new(slice),
             device,
+            interned: false,
+        }
+    }
+
+    pub(crate) fn interned(device: CudaDevice, slice: CudaSlice<T>) -> Self {
+        Self {
+            slice: std::mem::ManuallyDrop::new(slice),
+            device,
+            interned: true,
         }
     }
     #[inline]
@@ -96,15 +109,28 @@ impl<T> std::ops::Deref for InfoBuf<T> {
 
 impl<T> Drop for InfoBuf<T> {
     fn drop(&mut self) {
+        if self.interned {
+            // Owned by the intern table. Release the handle without touching
+            // the memory -- freeing it here would dangle every later hit.
+            let slice = unsafe { std::mem::ManuallyDrop::take(&mut self.slice) };
+            let _ = slice.leak();
+            return;
+        }
         if !self.device.alloc_cache_enabled() {
             unsafe { std::mem::ManuallyDrop::drop(&mut self.slice) };
+            self.device.count_driver_free();
             return;
         }
         let slice = unsafe { std::mem::ManuallyDrop::take(&mut self.slice) };
         let bytes = slice.len() * std::mem::size_of::<T>();
         let ptr = slice.leak();
         if !self.device.cache_put(bytes, ptr) {
-            drop(unsafe { self.device.cuda_stream_ref().upgrade_device_ptr::<u8>(ptr, 0) });
+            drop(unsafe {
+                self.device
+                    .cuda_stream_ref()
+                    .upgrade_device_ptr::<u8>(ptr, 0)
+            });
+            self.device.count_driver_free();
         }
     }
 }
@@ -1271,14 +1297,20 @@ impl Drop for CudaStorage {
         if !self.device.alloc_cache_enabled() {
             // Default path: free normally (byte-identical to upstream candle).
             unsafe { std::mem::ManuallyDrop::drop(&mut self.slice) };
+            self.device.count_driver_free();
             return;
         }
         // Caching ON: return the buffer to the device cache instead of freeing.
         let slice = unsafe { std::mem::ManuallyDrop::take(&mut self.slice) };
         let (bytes, ptr) = slice.byte_len_and_leak();
         if !self.device.cache_put(bytes, ptr) {
-            // Caching toggled off between the check and here; free the ptr.
-            drop(unsafe { self.device.cuda_stream_ref().upgrade_device_ptr::<u8>(ptr, 0) });
+            // Caching toggled off, or the cap refused it; free the ptr.
+            drop(unsafe {
+                self.device
+                    .cuda_stream_ref()
+                    .upgrade_device_ptr::<u8>(ptr, 0)
+            });
+            self.device.count_driver_free();
         }
     }
 }
@@ -1531,7 +1563,10 @@ impl BackendStorage for CudaStorage {
     fn try_clone(&self, layout: &Layout) -> Result<Self> {
         let slice = Clone.map(&*self.slice, self.device(), layout)?;
         let device = self.device.clone();
-        Ok(Self { slice: std::mem::ManuallyDrop::new(slice), device })
+        Ok(Self {
+            slice: std::mem::ManuallyDrop::new(slice),
+            device,
+        })
     }
 
     fn dtype(&self) -> DType {
@@ -1741,37 +1776,55 @@ impl BackendStorage for CudaStorage {
     fn affine(&self, layout: &Layout, mul: f64, add: f64) -> Result<Self> {
         let device = self.device().clone();
         let slice = Affine(mul, add).map(&*self.slice, &device, layout)?;
-        Ok(Self { slice: std::mem::ManuallyDrop::new(slice), device })
+        Ok(Self {
+            slice: std::mem::ManuallyDrop::new(slice),
+            device,
+        })
     }
 
     fn powf(&self, layout: &Layout, e: f64) -> Result<Self> {
         let device = self.device().clone();
         let slice = Powf(e).map(&*self.slice, &device, layout)?;
-        Ok(Self { slice: std::mem::ManuallyDrop::new(slice), device })
+        Ok(Self {
+            slice: std::mem::ManuallyDrop::new(slice),
+            device,
+        })
     }
 
     fn elu(&self, layout: &Layout, alpha: f64) -> Result<Self> {
         let device = self.device().clone();
         let slice = Elu(alpha).map(&*self.slice, &device, layout)?;
-        Ok(Self { slice: std::mem::ManuallyDrop::new(slice), device })
+        Ok(Self {
+            slice: std::mem::ManuallyDrop::new(slice),
+            device,
+        })
     }
 
     fn reduce_op(&self, op: ReduceOp, layout: &Layout, sum_dims: &[usize]) -> Result<Self> {
         let device = self.device().clone();
         let slice = FastReduce(sum_dims, op).map(&*self.slice, &device, layout)?;
-        Ok(Self { slice: std::mem::ManuallyDrop::new(slice), device })
+        Ok(Self {
+            slice: std::mem::ManuallyDrop::new(slice),
+            device,
+        })
     }
 
     fn cmp(&self, op: CmpOp, rhs: &Self, lhs_l: &Layout, rhs_l: &Layout) -> Result<Self> {
         let device = self.device().clone();
         let slice = Cmp(op).map(&*self.slice, lhs_l, &*rhs.slice, rhs_l, &device)?;
-        Ok(Self { slice: std::mem::ManuallyDrop::new(slice), device })
+        Ok(Self {
+            slice: std::mem::ManuallyDrop::new(slice),
+            device,
+        })
     }
 
     fn unary_impl<U: UnaryOpT>(&self, layout: &Layout) -> Result<Self> {
         let device = self.device().clone();
         let slice = U::V.map(&*self.slice, &device, layout)?;
-        Ok(Self { slice: std::mem::ManuallyDrop::new(slice), device })
+        Ok(Self {
+            slice: std::mem::ManuallyDrop::new(slice),
+            device,
+        })
     }
 
     fn binary_impl<B: BinaryOpT>(
@@ -1782,7 +1835,10 @@ impl BackendStorage for CudaStorage {
     ) -> Result<Self> {
         let device = self.device().clone();
         let slice = B::V.map(&*self.slice, lhs_l, &*rhs.slice, rhs_l, &device)?;
-        Ok(Self { slice: std::mem::ManuallyDrop::new(slice), device })
+        Ok(Self {
+            slice: std::mem::ManuallyDrop::new(slice),
+            device,
+        })
     }
 
     fn to_cpu_storage(&self) -> Result<CpuStorage> {
@@ -1848,7 +1904,10 @@ impl BackendStorage for CudaStorage {
     ) -> Result<Self> {
         let device = self.device().clone();
         let slice = WhereCond(self, layout).map(&*t.slice, t_l, &*f.slice, f_l, &device)?;
-        Ok(Self { slice: std::mem::ManuallyDrop::new(slice), device })
+        Ok(Self {
+            slice: std::mem::ManuallyDrop::new(slice),
+            device,
+        })
     }
 
     #[cfg(not(feature = "cudnn"))]
@@ -1864,7 +1923,10 @@ impl BackendStorage for CudaStorage {
         let device = self.device().clone();
         if !USE_IM2COL_CONV1D {
             let slice = Conv1D(params).map(&*self.slice, l, &*kernel.slice, kernel_l, &device)?;
-            return Ok(Self { slice: std::mem::ManuallyDrop::new(slice), device });
+            return Ok(Self {
+                slice: std::mem::ManuallyDrop::new(slice),
+                device,
+            });
         }
 
         let col = Im2Col1D {
@@ -1874,7 +1936,10 @@ impl BackendStorage for CudaStorage {
             padding: params.padding,
         }
         .map(&*self.slice, &device, l)?;
-        let col = Self { slice: std::mem::ManuallyDrop::new(col), device };
+        let col = Self {
+            slice: std::mem::ManuallyDrop::new(col),
+            device,
+        };
         let l_out = params.l_out();
         let b = params.b_size;
         let n = params.c_out;
@@ -1912,8 +1977,12 @@ impl BackendStorage for CudaStorage {
     ) -> Result<Self> {
         let device = self.device().clone();
         if !kernel_l.is_contiguous() {
-            let slice = Conv1D(params).map(&*self.slice, inp_l, &*kernel.slice, kernel_l, &device)?;
-            return Ok(Self { slice: std::mem::ManuallyDrop::new(slice), device });
+            let slice =
+                Conv1D(params).map(&*self.slice, inp_l, &*kernel.slice, kernel_l, &device)?;
+            return Ok(Self {
+                slice: std::mem::ManuallyDrop::new(slice),
+                device,
+            });
         }
         let l_out = params.l_out();
         let dst_el = params.c_out * l_out * params.b_size;
@@ -1970,7 +2039,10 @@ impl BackendStorage for CudaStorage {
             }
             _ => Err(CudaError::InternalError("dtype mismatch in conv1d"))?,
         };
-        Ok(Self { slice: std::mem::ManuallyDrop::new(slice), device })
+        Ok(Self {
+            slice: std::mem::ManuallyDrop::new(slice),
+            device,
+        })
     }
 
     fn conv_transpose1d(
@@ -2029,7 +2101,10 @@ impl BackendStorage for CudaStorage {
         } else {
             ConvTranspose1D(params).map(&*self.slice, l, &*kernel.slice, kernel_l, &device)?
         };
-        Ok(Self { slice: std::mem::ManuallyDrop::new(slice), device })
+        Ok(Self {
+            slice: std::mem::ManuallyDrop::new(slice),
+            device,
+        })
     }
 
     #[cfg(not(feature = "cudnn"))]
@@ -2045,7 +2120,10 @@ impl BackendStorage for CudaStorage {
         let device = self.device().clone();
         if !USE_IM2COL_CONV2D {
             let slice = Conv2D(params).map(&*self.slice, l, &*kernel.slice, kernel_l, &device)?;
-            return Ok(Self { slice: std::mem::ManuallyDrop::new(slice), device });
+            return Ok(Self {
+                slice: std::mem::ManuallyDrop::new(slice),
+                device,
+            });
         }
 
         let col = Im2Col {
@@ -2056,7 +2134,10 @@ impl BackendStorage for CudaStorage {
             padding: params.padding,
         }
         .map(&*self.slice, &device, l)?;
-        let col = Self { slice: std::mem::ManuallyDrop::new(col), device };
+        let col = Self {
+            slice: std::mem::ManuallyDrop::new(col),
+            device,
+        };
         let h_out = params.out_h();
         let w_out = params.out_w();
         let b = params.b_size;
@@ -2097,8 +2178,12 @@ impl BackendStorage for CudaStorage {
     ) -> Result<Self> {
         let device = self.device().clone();
         if !kernel_l.is_contiguous() {
-            let slice = Conv2D(params).map(&*self.slice, inp_l, &*kernel.slice, kernel_l, &device)?;
-            return Ok(Self { slice: std::mem::ManuallyDrop::new(slice), device });
+            let slice =
+                Conv2D(params).map(&*self.slice, inp_l, &*kernel.slice, kernel_l, &device)?;
+            return Ok(Self {
+                slice: std::mem::ManuallyDrop::new(slice),
+                device,
+            });
         }
         let (out_w, out_h) = (params.out_w(), params.out_h());
         let dst_el = params.c_out * out_w * out_h * params.b_size;
@@ -2155,7 +2240,10 @@ impl BackendStorage for CudaStorage {
             }
             _ => Err(CudaError::InternalError("dtype mismatch in conv2d"))?,
         };
-        Ok(Self { slice: std::mem::ManuallyDrop::new(slice), device })
+        Ok(Self {
+            slice: std::mem::ManuallyDrop::new(slice),
+            device,
+        })
     }
 
     fn conv_transpose2d(
@@ -2168,7 +2256,10 @@ impl BackendStorage for CudaStorage {
         let device = self.device().clone();
         let slice =
             ConvTranspose2D(params).map(&*self.slice, l, &*kernel.slice, kernel_l, &device)?;
-        Ok(Self { slice: std::mem::ManuallyDrop::new(slice), device })
+        Ok(Self {
+            slice: std::mem::ManuallyDrop::new(slice),
+            device,
+        })
     }
 
     fn avg_pool2d(&self, l: &Layout, k: (usize, usize), stride: (usize, usize)) -> Result<Self> {
@@ -2181,7 +2272,10 @@ impl BackendStorage for CudaStorage {
             op: PoolOp::Avg,
         }
         .map(&*self.slice, &device, l)?;
-        Ok(Self { slice: std::mem::ManuallyDrop::new(slice), device })
+        Ok(Self {
+            slice: std::mem::ManuallyDrop::new(slice),
+            device,
+        })
     }
 
     fn max_pool2d(&self, l: &Layout, k: (usize, usize), stride: (usize, usize)) -> Result<Self> {
@@ -2194,7 +2288,10 @@ impl BackendStorage for CudaStorage {
             op: PoolOp::Max,
         }
         .map(&*self.slice, &device, l)?;
-        Ok(Self { slice: std::mem::ManuallyDrop::new(slice), device })
+        Ok(Self {
+            slice: std::mem::ManuallyDrop::new(slice),
+            device,
+        })
     }
 
     fn upsample_nearest1d(&self, _: &Layout, _out_sz: usize) -> Result<Self> {
@@ -2204,7 +2301,10 @@ impl BackendStorage for CudaStorage {
     fn upsample_nearest2d(&self, l: &Layout, out_w: usize, out_h: usize) -> Result<Self> {
         let device = self.device().clone();
         let slice = UpsampleNearest2D(out_w, out_h).map(&*self.slice, &device, l)?;
-        Ok(Self { slice: std::mem::ManuallyDrop::new(slice), device })
+        Ok(Self {
+            slice: std::mem::ManuallyDrop::new(slice),
+            device,
+        })
     }
 
     fn upsample_bilinear2d(
@@ -2225,18 +2325,27 @@ impl BackendStorage for CudaStorage {
             scale_w_factor: scale_w,
         }
         .map(&*self.slice, &device, l)?;
-        Ok(Self { slice: std::mem::ManuallyDrop::new(slice), device })
+        Ok(Self {
+            slice: std::mem::ManuallyDrop::new(slice),
+            device,
+        })
     }
 
     fn index_select(&self, ids: &Self, l: &Layout, ids_l: &Layout, dim: usize) -> Result<Self> {
         let device = self.device().clone();
         let slice = IndexSelect(ids, ids_l, dim).map(&*self.slice, &device, l)?;
-        Ok(Self { slice: std::mem::ManuallyDrop::new(slice), device })
+        Ok(Self {
+            slice: std::mem::ManuallyDrop::new(slice),
+            device,
+        })
     }
     fn gather(&self, l: &Layout, ids: &Self, ids_l: &Layout, dim: usize) -> Result<Self> {
         let device = self.device().clone();
         let slice = Gather(ids, ids_l, dim).map(&*self.slice, &device, l)?;
-        Ok(Self { slice: std::mem::ManuallyDrop::new(slice), device })
+        Ok(Self {
+            slice: std::mem::ManuallyDrop::new(slice),
+            device,
+        })
     }
     fn scatter_set(
         &mut self,
@@ -2331,7 +2440,10 @@ impl BackendStorage for CudaStorage {
             _ => Err(CudaError::InternalError("dtype mismatch in matmul op"))?,
         };
         let device = dev.clone();
-        Ok(Self { slice: std::mem::ManuallyDrop::new(slice), device })
+        Ok(Self {
+            slice: std::mem::ManuallyDrop::new(slice),
+            device,
+        })
     }
 
     fn copy2d(

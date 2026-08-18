@@ -56,6 +56,178 @@ pub struct AllocCache {
     /// ARC_CACHE_DEBUG). A new miss DURING capture = an allocation that becomes
     /// an unstable graph memory node -> the cause of the launch fault/corruption.
     missed: std::collections::HashSet<usize>,
+    /// Hard cap on bytes parked in `free` + `deferred`. 0 = unlimited. A put
+    /// that would exceed it is refused (the caller frees normally), so the
+    /// arena's device footprint is bounded by construction rather than by hope.
+    /// Set via `set_alloc_cache_cap_bytes`.
+    cap_bytes: u64,
+    /// Content-addressed layout-info table: dims+strides bytes -> a device
+    /// buffer holding exactly those bytes, owned for the process lifetime.
+    ///
+    /// SAFETY / aliasing: every `info` parameter in candle-kernels is declared
+    /// `const size_t *` (checked: zero non-const `size_t *info` in the kernel
+    /// sources), so these buffers are read-only to the device. Two ops with
+    /// byte-identical dims/strides therefore cannot observe a difference
+    /// between sharing one buffer and holding two copies of the same bytes.
+    /// Interning is also strictly SAFER than the previous path, which freed the
+    /// buffer at `InfoBuf::drop` — i.e. potentially before the kernel that
+    /// reads it has retired, relying entirely on stream ordering.
+    intern: HashMap<Box<[usize]>, cudarc::driver::sys::CUdeviceptr>,
+    intern_bytes: u64,
+    /// 0 = interning off (upstream behaviour: one alloc + one H2D per op).
+    intern_max_entries: usize,
+    stats: AllocStats,
+}
+
+/// Counters for the caching allocator and the layout-info intern table.
+///
+/// These exist to answer one question with a number instead of an opinion:
+/// **how many `cuMemAllocAsync` and how many dims/strides H2D copies does one
+/// decode step actually issue?** `driver_allocs` counts the calls an nsys trace
+/// would show, so the counter and the trace are two independent instruments
+/// that must agree.
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AllocStats {
+    /// `cuMemAllocAsync` actually issued (cache miss, or cache disabled).
+    pub driver_allocs: u64,
+    pub driver_alloc_bytes: u64,
+    /// Allocations served from the free list — no driver call.
+    pub cache_hits: u64,
+    /// Buffers accepted back into the cache.
+    pub cache_puts: u64,
+    /// Puts refused because the cap was reached; the caller freed instead.
+    pub cache_puts_refused: u64,
+    /// `cuMemFreeAsync` actually issued (cache off, put refused, or drain).
+    pub driver_frees: u64,
+    /// dims/strides H2D copies actually issued.
+    pub info_uploads: u64,
+    /// dims/strides H2D copies elided by the intern table.
+    pub info_hits: u64,
+    /// H2D copies of real tensor data (`clone_htod` from a CpuStorage). Kept
+    /// separate so the trace's total H2D count can be attributed rather than
+    /// guessed at.
+    pub data_htod: u64,
+    /// Bytes currently parked in `free` + `deferred`, maintained incrementally.
+    pub cached_bytes: u64,
+    /// High-water mark of `cached_bytes` — the arena's peak device footprint.
+    pub cached_bytes_hwm: u64,
+    pub intern_entries: u64,
+    pub intern_bytes: u64,
+}
+
+/// Result of [`CudaDevice::verify_alloc_accounting`].
+///
+/// D33: an instrument that cannot report the bad answer is not an instrument.
+/// `cached_bytes` is maintained incrementally on every put/take; `recomputed`
+/// walks the free list and the deferred list and adds the sizes up from
+/// scratch. If a put, a take, a drain or a cap refusal ever fails to update the
+/// running total, the two disagree. They cannot both be right and disagree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AllocAccounting {
+    pub running: u64,
+    pub recomputed: u64,
+    pub buffers: u64,
+}
+
+/// Round an allocation up to a reuse bucket.
+///
+/// # Why bucketing is not optional
+///
+/// The free list is keyed by size. A decode step whose tensors depend on the
+/// KV length asks for a slightly *different* size every step, so an
+/// exact-size cache misses every step (allocations never reach zero) **and**
+/// retains one buffer per distinct length — a leak that grows with context.
+/// Rounding to a bucket collapses that family onto a bounded set of keys.
+///
+/// # The correctness constraint
+///
+/// `bucket(n) >= n` for all `n`, and a buffer is physically allocated at its
+/// bucket size on a miss (see `alloc`). So any request served from bucket `k`
+/// asks for at most `k` bytes and the buffer physically holds `k`. Allocating
+/// the *requested* size while filing it under a larger key would hand out a
+/// short buffer — a silent out-of-bounds write, not a crash.
+///
+/// Granularity is an eighth of the enclosing octave: at most 12.5% waste, and
+/// eight buckets per octave.
+fn bucket(bytes: usize) -> usize {
+    const MIN: usize = 128;
+    if bytes == 0 {
+        return 0;
+    }
+    if bytes <= MIN {
+        return MIN;
+    }
+    let floor_pow2 = 1usize << (usize::BITS - 1 - bytes.leading_zeros());
+    let gran = (floor_pow2 >> 3).max(MIN);
+    bytes.div_ceil(gran) * gran
+}
+
+#[cfg(test)]
+mod bucket_tests {
+    use super::bucket;
+
+    #[test]
+    fn bucket_never_shrinks_a_request() {
+        // The safety property the whole scheme rests on.
+        for n in 1usize..100_000 {
+            assert!(bucket(n) >= n, "bucket({n}) = {} < {n}", bucket(n));
+        }
+        for shift in 10..40 {
+            for delta in [-3i64, -1, 0, 1, 3] {
+                let n = ((1i64 << shift) + delta) as usize;
+                assert!(bucket(n) >= n, "bucket({n}) = {} < {n}", bucket(n));
+            }
+        }
+    }
+
+    #[test]
+    fn bucket_is_idempotent() {
+        // put() and take() both round; if rounding were not idempotent a
+        // buffer could be filed under a key larger than its physical size.
+        for n in [
+            1usize,
+            127,
+            128,
+            129,
+            1024,
+            1025,
+            4096,
+            1 << 20,
+            (1 << 20) + 7,
+        ] {
+            assert_eq!(bucket(bucket(n)), bucket(n), "not idempotent at {n}");
+        }
+    }
+
+    #[test]
+    fn bucket_waste_is_bounded() {
+        for n in 129usize..200_000 {
+            let b = bucket(n);
+            assert!(
+                b <= n + n / 8 + 128,
+                "bucket({n}) = {b} wastes more than 12.5%"
+            );
+        }
+    }
+
+    #[test]
+    fn bucket_collapses_a_growing_kv_family() {
+        // The motivating case: a tensor that grows by one KV slot per step must
+        // not produce a new key every step.
+        let keys: std::collections::HashSet<usize> =
+            (0..4096).map(|step| bucket(65536 + step * 128)).collect();
+        assert!(
+            keys.len() < 64,
+            "{} distinct buckets for 4096 KV lengths -- still a per-step leak",
+            keys.len()
+        );
+    }
+}
+
+impl AllocAccounting {
+    pub fn agrees(&self) -> bool {
+        self.running == self.recomputed
+    }
 }
 
 #[derive(Clone)]
@@ -86,6 +258,8 @@ impl CudaDevice {
                 cache.capturing = false;
                 let mut d: Vec<_> = cache.free.drain().flat_map(|(_, v)| v).collect();
                 d.extend(cache.deferred.drain(..).map(|(_, p)| p));
+                cache.stats.cached_bytes = 0;
+                cache.stats.driver_frees += d.len() as u64;
                 d
             }
         };
@@ -99,19 +273,78 @@ impl CudaDevice {
         self.alloc_cache.lock().unwrap().enabled
     }
 
-    /// Enter/leave capture mode. While in capture mode, freed buffers are parked
-    /// (not reusable) to avoid within-capture buffer aliasing. Leaving capture
-    /// mode returns all parked buffers to the free pool.
+    /// Bound the arena's device footprint. `cap_bytes == 0` means unlimited
+    /// (the previous behaviour). Once `free` + `deferred` hold `cap_bytes`, a
+    /// further put is refused and the caller frees normally — so the arena can
+    /// never grow past a number you chose, and `AllocStats::cache_puts_refused`
+    /// tells you if the cap is actually binding rather than leaving you to
+    /// wonder.
+    pub fn set_alloc_cache_cap_bytes(&self, cap_bytes: u64) {
+        self.alloc_cache.lock().unwrap().cap_bytes = cap_bytes;
+    }
+
+    /// Enable content-addressed interning of dims/strides uploads.
     ///
-    /// Protocol for an allocation-free capture:
-    /// 1. `set_alloc_cache_enabled(true)`
-    /// 2. eager warmup forwards (warm cuBLAS algos + kernels)
-    /// 3. `set_capture_mode(true)`; one eager forward; `set_capture_mode(false)`
-    ///    -- this "deferred-free" pass grows `free` to the full per-forward
-    ///    allocation count (no reuse, so every alloc is distinct).
-    /// 4. `set_capture_mode(true)`; begin_capture; forward; end_capture;
-    ///    `set_capture_mode(false)` -- every alloc is now a cache hit at a stable
-    ///    address, every free is deferred -> no graph memory nodes, no aliasing.
+    /// `max_entries == 0` disables it (upstream behaviour: one allocation and
+    /// one `cuMemcpyHtoDAsync` per op that needs layout metadata). Otherwise a
+    /// layout whose bytes have been uploaded before is served from the table
+    /// with **no allocation and no copy**. Entries are owned for the process
+    /// lifetime; the table is capped because an unbounded map keyed on tensor
+    /// shapes is a leak on a workload with unbounded shape variety.
+    ///
+    /// A decode step at fixed batch and fixed head count issues the same
+    /// handful of distinct layouts every step, which is exactly the case this
+    /// serves. `AllocStats::intern_entries` reports how many distinct layouts
+    /// were actually seen, so "the table is small" is a measurement, not a
+    /// premise.
+    pub fn set_info_intern_max_entries(&self, max_entries: usize) {
+        self.alloc_cache.lock().unwrap().intern_max_entries = max_entries;
+    }
+
+    /// Snapshot the allocator/H2D counters.
+    pub fn alloc_stats(&self) -> AllocStats {
+        let cache = self.alloc_cache.lock().unwrap();
+        let mut s = cache.stats;
+        s.intern_entries = cache.intern.len() as u64;
+        s.intern_bytes = cache.intern_bytes;
+        s
+    }
+
+    /// Zero the counters (not the pools). Call between benchmark legs so a
+    /// per-step rate is measured over a known number of steps.
+    pub fn reset_alloc_stats(&self) {
+        let mut cache = self.alloc_cache.lock().unwrap();
+        let hwm = cache.stats.cached_bytes_hwm;
+        let cached = cache.stats.cached_bytes;
+        cache.stats = AllocStats::default();
+        // Footprint is a level, not a rate: carry it across a reset.
+        cache.stats.cached_bytes = cached;
+        cache.stats.cached_bytes_hwm = hwm;
+    }
+
+    /// Recompute the cached-byte total from the pools and return it alongside
+    /// the incrementally maintained one. See [`AllocAccounting`] — these two
+    /// numbers are produced by disjoint code paths and cannot both be right and
+    /// disagree, which is the point.
+    pub fn verify_alloc_accounting(&self) -> AllocAccounting {
+        let cache = self.alloc_cache.lock().unwrap();
+        let mut recomputed = 0u64;
+        let mut buffers = 0u64;
+        for (bytes, ptrs) in cache.free.iter() {
+            recomputed += (*bytes as u64) * (ptrs.len() as u64);
+            buffers += ptrs.len() as u64;
+        }
+        for (bytes, _) in cache.deferred.iter() {
+            recomputed += *bytes as u64;
+            buffers += 1;
+        }
+        AllocAccounting {
+            running: cache.stats.cached_bytes,
+            recomputed,
+            buffers,
+        }
+    }
+
     /// Free EVERY cached buffer immediately, while the pool they were allocated
     /// from is still alive.
     ///
@@ -197,7 +430,12 @@ impl CudaDevice {
         if !cache.enabled {
             return None;
         }
+        let bytes = bucket(bytes);
         let hit = cache.free.get_mut(&bytes).and_then(|v| v.pop());
+        if hit.is_some() {
+            cache.stats.cache_hits += 1;
+            cache.stats.cached_bytes = cache.stats.cached_bytes.saturating_sub(bytes as u64);
+        }
         if hit.is_none() && cache.missed.insert(bytes) {
             if cache.capturing {
                 // A miss DURING capture means this size was not pre-warmed: the
@@ -226,11 +464,52 @@ impl CudaDevice {
         if !cache.enabled {
             return false;
         }
+        let bytes = bucket(bytes);
+        // Bounded by construction: refuse rather than grow past the cap. The
+        // caller then frees normally, so the arena's footprint is the cap and
+        // `cache_puts_refused` says whether the cap ever bound.
+        if cache.cap_bytes != 0 && cache.stats.cached_bytes + bytes as u64 > cache.cap_bytes {
+            cache.stats.cache_puts_refused += 1;
+            return false;
+        }
         if cache.capturing {
             cache.deferred.push((bytes, ptr));
         } else {
             cache.free.entry(bytes).or_default().push(ptr);
         }
+        cache.stats.cache_puts += 1;
+        cache.stats.cached_bytes += bytes as u64;
+        if cache.stats.cached_bytes > cache.stats.cached_bytes_hwm {
+            cache.stats.cached_bytes_hwm = cache.stats.cached_bytes;
+        }
+        true
+    }
+
+    /// Look up an already-uploaded dims/strides buffer by its exact contents.
+    fn info_intern_get(&self, key: &[usize]) -> Option<cudarc::driver::sys::CUdeviceptr> {
+        let cache = self.alloc_cache.lock().unwrap();
+        if cache.intern_max_entries == 0 {
+            return None;
+        }
+        cache.intern.get(key).copied()
+    }
+
+    /// Record a freshly uploaded dims/strides buffer. Returns false if the table
+    /// is full or interning is off, in which case the caller keeps ownership and
+    /// frees/caches the buffer the normal way.
+    fn info_intern_put(&self, key: &[usize], ptr: cudarc::driver::sys::CUdeviceptr) -> bool {
+        let mut cache = self.alloc_cache.lock().unwrap();
+        if cache.intern_max_entries == 0 || cache.intern.len() >= cache.intern_max_entries {
+            return false;
+        }
+        if cache.intern.insert(key.into(), ptr).is_some() {
+            // Raced with another thread that interned the same layout; the
+            // previous pointer is now unreachable. Keep the new one and let the
+            // old one leak rather than free a buffer a kernel may be reading.
+            // Bounded by the table cap and only reachable under contention.
+            return true;
+        }
+        cache.intern_bytes += (key.len() * std::mem::size_of::<usize>()) as u64;
         true
     }
 
@@ -256,7 +535,42 @@ impl CudaDevice {
             // Reuse a cached buffer (no cuMemAllocAsync -> graph-capture safe).
             return Ok(unsafe { self.stream.upgrade_device_ptr::<T>(ptr, len) });
         }
+        if let Some(ptr) = self.alloc_bucketed(bytes)? {
+            return Ok(unsafe { self.stream.upgrade_device_ptr::<T>(ptr, len) });
+        }
+        self.count_driver_alloc(bytes);
         self.stream.alloc::<T>(len).w()
+    }
+
+    /// Cache-miss allocation while the arena is enabled: allocate the BUCKET
+    /// size, not the requested size, so that when this buffer is later filed
+    /// under its bucket key it genuinely holds that many bytes. Returns `None`
+    /// when the arena is off, in which case the caller allocates exactly the
+    /// requested size (byte-identical to upstream candle).
+    fn alloc_bucketed(&self, bytes: usize) -> Result<Option<cudarc::driver::sys::CUdeviceptr>> {
+        if bytes == 0 || !self.alloc_cache_enabled() {
+            return Ok(None);
+        }
+        let b = bucket(bytes);
+        self.count_driver_alloc(b);
+        let raw = self.stream.alloc::<u8>(b).w()?;
+        Ok(Some(raw.leak()))
+    }
+
+    /// One `cuMemAllocAsync` is about to be issued. This counter is the whole
+    /// point of the instrumentation: it counts exactly the call an nsys trace
+    /// records, so counter and trace are two independent instruments that must
+    /// agree — and it is incremented on the MISS path, which means it reports
+    /// the large number when the arena is off. An instrument that can only
+    /// report zero is not evidence.
+    fn count_driver_alloc(&self, bytes: usize) {
+        let mut cache = self.alloc_cache.lock().unwrap();
+        cache.stats.driver_allocs += 1;
+        cache.stats.driver_alloc_bytes += bytes as u64;
+    }
+
+    pub(crate) fn count_driver_free(&self) {
+        self.alloc_cache.lock().unwrap().stats.driver_frees += 1;
     }
 
     pub fn alloc_zeros<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits>(
@@ -269,6 +583,12 @@ impl CudaDevice {
             self.stream.memset_zeros(&mut slice).w()?;
             return Ok(slice);
         }
+        if let Some(ptr) = self.alloc_bucketed(bytes)? {
+            let mut slice = unsafe { self.stream.upgrade_device_ptr::<T>(ptr, len) };
+            self.stream.memset_zeros(&mut slice).w()?;
+            return Ok(slice);
+        }
+        self.count_driver_alloc(bytes);
         self.stream.alloc_zeros::<T>(len).w()
     }
 
@@ -330,6 +650,7 @@ impl CudaDevice {
         // is OFF this is identical to alloc + memcpy (no behavior change).
         let len = cudarc::driver::HostSlice::len(src);
         let mut dst = unsafe { self.alloc::<T>(len)? };
+        self.alloc_cache.lock().unwrap().stats.data_htod += 1;
         self.stream.memcpy_htod(src, &mut dst).w()?;
         Ok(dst)
     }
@@ -346,16 +667,66 @@ impl CudaDevice {
     /// reduce kernel indexes out of bounds -> MMU fault. Leaking a copy keeps the
     /// source valid for the first launch and all replays. Bounded + tiny (a few
     /// dozen bytes per distinct reduce/index site, only while capturing).
+    ///
+    /// # Interning (Arc budget chain: 2,811 H2D copies per decode token)
+    ///
+    /// A B=1 decode step re-uploads the *same* dims/strides bytes every step —
+    /// the shapes do not change. Measured on the V4 H200 trace: 2,509 of the
+    /// 2,811 H2D copies per token are `usize` layout arrays averaging 72 B.
+    /// With `set_info_intern_max_entries(n)` a layout whose bytes were uploaded
+    /// before is served from a device buffer that already holds them: **no
+    /// allocation and no copy**.
+    ///
+    /// Safety of sharing one buffer between ops: every `info` parameter in
+    /// candle-kernels is `const size_t *` (verified: no non-const `size_t *info`
+    /// exists in the kernel sources), so the buffer is read-only to the device
+    /// and two ops with byte-identical layouts cannot tell a shared buffer from
+    /// two private ones. It is also strictly safer than the non-interned path,
+    /// which hands the buffer back at `InfoBuf::drop` — i.e. possibly before the
+    /// kernel reading it has retired.
     pub fn htod_info<T: cudarc::driver::DeviceRepr + Copy + 'static>(
         &self,
         src: &[T],
     ) -> Result<super::InfoBuf<T>> {
+        // Only `usize` layout arrays are interned. Restricting by TypeId keeps
+        // the byte-level key sound: `usize` has no padding, so equal bytes mean
+        // equal values, which is not guaranteed for an arbitrary `DeviceRepr`.
+        let internable = std::any::TypeId::of::<T>() == std::any::TypeId::of::<usize>();
+        if internable {
+            // SAFETY: guarded by the TypeId check above, so T is exactly usize.
+            let key: &[usize] =
+                unsafe { std::slice::from_raw_parts(src.as_ptr().cast::<usize>(), src.len()) };
+            if let Some(ptr) = self.info_intern_get(key) {
+                let mut cache = self.alloc_cache.lock().unwrap();
+                cache.stats.info_hits += 1;
+                drop(cache);
+                let slice = unsafe { self.stream.upgrade_device_ptr::<T>(ptr, src.len()) };
+                return Ok(super::InfoBuf::interned(self.clone(), slice));
+            }
+        }
         let mut dst = unsafe { self.alloc::<T>(src.len())? };
+        self.alloc_cache.lock().unwrap().stats.info_uploads += 1;
         if self.capture_mode() {
             let leaked: &'static [T] = Vec::leak(src.to_vec());
             self.stream.memcpy_htod(leaked, &mut dst).w()?;
         } else {
             self.stream.memcpy_htod(src, &mut dst).w()?;
+        }
+        if internable {
+            // SAFETY: as above, T is exactly usize.
+            let key: &[usize] =
+                unsafe { std::slice::from_raw_parts(src.as_ptr().cast::<usize>(), src.len()) };
+            // `leak` consumes the slice without freeing, so the table can own
+            // the buffer for the process lifetime.
+            let len = src.len();
+            let ptr = dst.leak();
+            let slice = unsafe { self.stream.upgrade_device_ptr::<T>(ptr, len) };
+            return if self.info_intern_put(key, ptr) {
+                Ok(super::InfoBuf::interned(self.clone(), slice))
+            } else {
+                // Table full: hand ownership back so it frees/caches normally.
+                Ok(super::InfoBuf::new(self.clone(), slice))
+            };
         }
         Ok(super::InfoBuf::new(self.clone(), dst))
     }

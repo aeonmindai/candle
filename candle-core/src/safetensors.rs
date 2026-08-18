@@ -309,9 +309,7 @@ fn convert(view: &st::TensorView<'_>, device: &Device) -> Result<Tensor> {
             let conv = |x: u8| Ok(f32::from_bits((x as u32) << 23));
             convert_with_cast_::<u8, f32, _>(view, device, conv)
         }
-        st::Dtype::F6_E2M3 | st::Dtype::F6_E3M2 | st::Dtype::F4 => {
-            convert_dummy(view, device)
-        }
+        st::Dtype::F6_E2M3 | st::Dtype::F6_E3M2 | st::Dtype::F4 => convert_dummy(view, device),
         dtype => Err(Error::UnsupportedSafeTensorDtype(dtype)),
     }
 }
