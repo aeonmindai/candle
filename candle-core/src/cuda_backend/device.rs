@@ -154,8 +154,16 @@ fn bucket(bytes: usize) -> usize {
     if bytes == 0 {
         return 0;
     }
+    // Below the bucketing floor, key on the EXACT size. Rounding tiny buffers
+    // up to MIN would file them under a key larger than they are, which the
+    // put side must then refuse -- and refusing means every sub-128-byte
+    // buffer allocates and frees through the driver on every single step.
+    // Measured: driver_allocs 3812.8 alongside driver_frees 3672.8 per token,
+    // an alloc/free pair per small buffer per step, with the arena on.
+    // Exact keys are safe here because physical == key, and cheap because the
+    // number of distinct tiny sizes is small.
     if bytes <= MIN {
-        return MIN;
+        return bytes;
     }
     let floor_pow2 = 1usize << (usize::BITS - 1 - bytes.leading_zeros());
     let gran = (floor_pow2 >> 3).max(MIN);
@@ -182,8 +190,13 @@ fn bucket(bytes: usize) -> usize {
 /// steady-state reuse is not affected.
 fn bucket_down(bytes: usize) -> usize {
     const MIN: usize = 128;
-    if bytes < MIN {
-        return 0; // too small to file safely; caller frees it normally
+    if bytes == 0 {
+        return 0;
+    }
+    // Mirror `bucket`: exact keys below the floor, so physical == key and the
+    // buffer is cacheable rather than being bounced to the driver every step.
+    if bytes <= MIN {
+        return bytes;
     }
     let floor_pow2 = 1usize << (usize::BITS - 1 - bytes.leading_zeros());
     let gran = (floor_pow2 >> 3).max(MIN);
@@ -275,6 +288,20 @@ mod bucket_tests {
         for n in [200usize, 1000, 4096, 1 << 16, (1 << 20) + 5] {
             let b = bucket(n);
             assert_eq!(bucket_down(b), b, "arena-allocated {b} did not file unchanged");
+        }
+    }
+
+
+    #[test]
+    fn small_buffers_are_cacheable() {
+        // A key of 0 means "refuse to cache", which sends the buffer to the
+        // driver. Tiny allocations are the most frequent ones in the decode
+        // loop, so excluding them defeats the arena for the bulk of its
+        // traffic while still looking like it is working.
+        for n in 1usize..=128 {
+            assert_eq!(bucket(n), n, "bucket({n}) should key exactly");
+            assert_eq!(bucket_down(n), n, "bucket_down({n}) should key exactly");
+            assert_ne!(bucket_down(n), 0, "size {n} would be refused by the cache");
         }
     }
 
