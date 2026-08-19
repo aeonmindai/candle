@@ -518,29 +518,38 @@ impl CudaDevice {
         if std::env::var_os("ARC_NO_DEFERRED_FREE").is_some() {
             return;
         }
-        // Leaving capture returns the parked buffers to the free pool. That can
-        // put retention over capacity, so the eviction victims have to be freed
-        // here too — outside the lock.
-        let victims = {
-            let mut cache = self.alloc_cache.lock().unwrap();
-            cache.capturing = capturing;
-            if capturing {
-                Vec::new()
-            } else {
-                let deferred = std::mem::take(&mut cache.deferred);
-                // `deferred` was already counted in cached_bytes when it was
-                // parked; re-filing it must not double-count.
-                cache.cached_bytes -= deferred.iter().map(|(b, _)| *b).sum::<usize>();
-                cache.cached_buffers -= deferred.len();
-                let mut victims = Vec::new();
-                for (bytes, ptr) in deferred {
-                    victims.extend(cache.put(bytes, ptr));
-                }
-                victims
+        // Leaving capture returns the parked buffers to the free pool.
+        //
+        // Deliberately WITHOUT eviction, even though this can leave retention
+        // over the cap until the next ordinary put. Capture installs a private
+        // memory pool as the device default, and buffers allocated during a
+        // capture come from it; `AllocCache` records no pool provenance, so it
+        // cannot tell those apart from default-pool buffers. Freeing one after
+        // its pool is destroyed corrupts the driver's host-side bookkeeping —
+        // which lives in the process's glibc arena, and surfaces as `corrupted
+        // size vs. prev_size` at an arbitrary later allocation. See
+        // `drain_alloc_cache_and_free`.
+        //
+        // The capture path already drains the cache explicitly before every
+        // `cuMemPoolDestroy`. That discipline only works if draining is the
+        // *only* thing that hands buffers back, so eviction — which fires on
+        // whatever put happens to cross the cap — must not run inside the
+        // capture window. Retention is bounded again on the first decode put
+        // after capture, by which point the drain has removed any private-pool
+        // pointer.
+        let mut cache = self.alloc_cache.lock().unwrap();
+        cache.capturing = capturing;
+        if !capturing {
+            let deferred = std::mem::take(&mut cache.deferred);
+            // Already counted in `cached_bytes` when parked, so only the
+            // recency stamp changes hands here.
+            cache.tick += 1;
+            let tick = cache.tick;
+            for (bytes, ptr) in deferred {
+                let sc = cache.free.entry(bytes).or_default();
+                sc.ptrs.push(ptr);
+                sc.tick = tick;
             }
-        };
-        for ptr in victims {
-            drop(unsafe { self.stream.upgrade_device_ptr::<u8>(ptr, 0) });
         }
     }
 
