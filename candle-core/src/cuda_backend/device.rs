@@ -30,16 +30,134 @@ pub struct ModuleStore {
     mdls: [Option<Arc<cudarc::driver::CudaModule>>; kernels::ALL_IDS.len()],
 }
 
+// ---------------------------------------------------------------------------
+// Size-class ladder
+// ---------------------------------------------------------------------------
+
+/// Quarter-power-of-two size classes, the standard ladder shape (jemalloc,
+/// PyTorch's `CUDACachingAllocator`): four evenly spaced classes per octave.
+///
+/// This cache does **not** serve a request from a different size than it asks
+/// for — see [`AllocCache::take`] for why that would be unsound here — so the
+/// ladder is not used for matching. It is used to keep the diagnostic `missed`
+/// set bounded: byte counts track KV length and are unbounded, size classes are
+/// not (221 of them on a 64-bit target).
+const LADDER_BASE_LOG2: u32 = 9; // 512 B
+const SUBCLASSES: usize = 4;
+
+/// The size class `bytes` falls in. Monotonic non-decreasing in `bytes`.
+#[inline]
+fn bucket_index(bytes: usize) -> usize {
+    if bytes < (1usize << LADDER_BASE_LOG2) {
+        return 0;
+    }
+    // floor(log2(bytes)); >= LADDER_BASE_LOG2 by the branch above.
+    let k = usize::BITS - 1 - bytes.leading_zeros();
+    // Which quarter of [2^k, 2^(k+1)) `bytes` sits in.
+    let sub = (bytes - (1usize << k)) >> (k - 2);
+    1 + ((k - LADDER_BASE_LOG2) as usize) * SUBCLASSES + sub as usize
+}
+
+/// Cached buffers of one exact byte size, plus the recency stamp that orders
+/// them for eviction.
+#[derive(Default)]
+struct SizeClass {
+    ptrs: Vec<cudarc::driver::sys::CUdeviceptr>,
+    /// Monotonic stamp of the last put or hit at this size. Eviction order.
+    tick: u64,
+}
+
+/// Counters for the caching allocator. Every number here is a count of a real
+/// driver call or a real retained byte — nothing is inferred.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AllocCacheStats {
+    /// Allocations served from the cache (no `cuMemAllocAsync`).
+    pub hits: u64,
+    /// Allocations that fell through to `cuMemAllocAsync` **while the cache was
+    /// enabled**. This is "allocations per step" for a decode loop.
+    pub misses: u64,
+    /// Buffers accepted into the cache instead of being freed.
+    pub puts: u64,
+    /// Buffers handed back to the driver by capacity eviction.
+    pub evicted: u64,
+    /// Buffers handed back to the driver by `set_alloc_cache_enabled(false)` or
+    /// `drain_alloc_cache_and_free()`.
+    pub drained: u64,
+    /// Bytes currently retained (`free` + `deferred`).
+    pub cached_bytes: usize,
+    /// Buffers currently retained.
+    pub cached_buffers: usize,
+    /// Largest `cached_bytes` ever reached. The number that says whether the
+    /// capacity is doing anything.
+    pub high_water_bytes: usize,
+    /// The cap. `usize::MAX` means unbounded.
+    pub capacity_bytes: usize,
+    /// Distinct (size class, physical size) groups currently held.
+    pub size_classes: usize,
+}
+
+impl AllocCacheStats {
+    /// Buffers returned to the driver, by any route. "Frees per step".
+    pub fn frees(&self) -> u64 {
+        self.evicted + self.drained
+    }
+}
+
+/// Default cap: 1 GiB. Chosen to be far larger than a decode step's working set
+/// and far smaller than any card this runs on, so the cap only ever bites the
+/// unbounded-growth case it exists to stop. Override with
+/// `CANDLE_ALLOC_CACHE_MAX_MB` (`0` = unbounded, which is the old behaviour).
+const DEFAULT_CAPACITY_BYTES: usize = 1024 * 1024 * 1024;
+
 /// Opt-in CUDA caching allocator for graph-capture safety (RUN-161).
 ///
-/// When `enabled`, freed device buffers are returned to `free` (keyed by byte
-/// size) instead of `cuMemFreeAsync`, and `alloc` reuses them via
-/// `upgrade_device_ptr` instead of `cuMemAllocAsync`. Warming the cache (a few
-/// eager forwards at the capture shapes) then makes a captured forward
-/// allocation-free: stable addresses (no MMU fault), no alloc/free graph nodes,
-/// no cross-stream capture isolation. Default OFF -> candle's alloc/free is
-/// byte-identical to upstream, so existing models are unaffected.
-#[derive(Default)]
+/// When `enabled`, freed device buffers are returned to `free` instead of
+/// `cuMemFreeAsync`, and `alloc` reuses them via `upgrade_device_ptr` instead of
+/// `cuMemAllocAsync`. Warming the cache (a few eager forwards at the capture
+/// shapes) then makes a captured forward allocation-free: stable addresses (no
+/// MMU fault), no alloc/free graph nodes, no cross-stream capture isolation.
+/// Default OFF -> candle's alloc/free is byte-identical to upstream, so existing
+/// models are unaffected.
+///
+/// # Bounded, and why it has to be
+///
+/// The first version of this cache had **no capacity and no eviction**: the only
+/// ways memory went back to the driver were `set_alloc_cache_enabled(false)` and
+/// `drain_alloc_cache_and_free()`. That is fatal for a long generation, because
+/// a decode step allocates buffers whose size tracks the KV length — measured on
+/// DeepSeek-V4, a family of ~132 buffers stepping by 8 KiB per token. Each one
+/// is a byte size nothing ever asks for again, so the cache filed ~132
+/// permanently-dead entries per token and freed nothing. Measured growth: **6.04
+/// MiB per decoded token with no plateau** (`memory.used`, 2 Hz, 2 600 tokens),
+/// against exactly 0.00 for the same run with the cache off.
+///
+/// So retention is now capped. `cached_bytes` is tracked exactly; crossing
+/// `capacity` frees least-recently-used buffers back to the driver until
+/// retention is under the low-water mark. Buffers reused every step keep a fresh
+/// tick and survive; the per-step-unique sizes go stale and are evicted first.
+/// That bounds retention unconditionally, whatever the shape traffic looks like.
+///
+/// # Why sizes are matched exactly and not by class
+///
+/// The obvious next step — group nearby sizes so a 106 496 byte buffer can serve
+/// a 114 688 byte request — is **not sound here**, and the reason is worth
+/// recording so it is not re-attempted.
+///
+/// A buffer's size is not stored anywhere. It is recomputed on free, in
+/// `CudaStorageSlice::byte_len_and_leak`, as `slice.len() * size_of::<T>()` —
+/// the length of the slice the *requester* was handed. Serve a 128-byte buffer
+/// to a 120-byte request and it comes back recorded as 120. Serve that to a
+/// 100-byte request and it comes back as 100. The recorded size ratchets down
+/// on every reuse while the real allocation stays 128, so `cached_bytes`
+/// silently under-counts and the cap stops bounding anything. Class-based
+/// matching therefore needs per-pointer physical sizes (a hash lookup on every
+/// free, ~11 k of them per token) before it is safe at all.
+///
+/// It also buys much less than it looks like it does. Class matching would drive
+/// the ~132 misses per step towards zero — worth roughly 0.26 ms/token of
+/// `cuMemAllocAsync` — while the 3.73 ms/token this cache is actually worth
+/// comes from absorbing the other ~11 300 allocations, which exact matching
+/// already does. The cap is what fixes the leak; classes were the hypothesis.
 pub struct AllocCache {
     enabled: bool,
     /// While `capturing`, buffers freed (Drop -> cache_put) are NOT returned to
@@ -49,13 +167,217 @@ pub struct AllocCache {
     /// capture mode ends. This guarantees every allocation during a captured
     /// forward gets a unique, stable address. (RUN-161, PyTorch-style.)
     capturing: bool,
-    free: HashMap<usize, Vec<cudarc::driver::sys::CUdeviceptr>>,
+    /// Free buffers, keyed by their exact byte size.
+    free: HashMap<usize, SizeClass>,
     /// Buffers freed during capture, parked until capture mode ends.
     deferred: Vec<(usize, cudarc::driver::sys::CUdeviceptr)>,
-    /// Debug: byte-sizes that have missed the cache (logged once each under
+    /// Debug: size classes that have missed the cache (logged once each under
     /// ARC_CACHE_DEBUG). A new miss DURING capture = an allocation that becomes
     /// an unstable graph memory node -> the cause of the launch fault/corruption.
+    /// Keyed by class rather than byte count so it cannot itself grow without
+    /// bound.
     missed: std::collections::HashSet<usize>,
+    /// Bytes retained in `free` + `deferred`. Maintained incrementally; the
+    /// tests assert it against a full recount.
+    cached_bytes: usize,
+    /// Buffers retained in `free` + `deferred`.
+    cached_buffers: usize,
+    /// Hard cap on `cached_bytes`. `usize::MAX` = unbounded.
+    capacity: usize,
+    /// Monotonic stamp source for LRU.
+    tick: u64,
+    hits: u64,
+    misses: u64,
+    puts: u64,
+    evicted: u64,
+    drained: u64,
+    high_water_bytes: usize,
+}
+
+impl Default for AllocCache {
+    fn default() -> Self {
+        let capacity = match std::env::var("CANDLE_ALLOC_CACHE_MAX_MB") {
+            Ok(v) => match v.trim().parse::<usize>() {
+                // 0 means "no cap" — the pre-bounding behaviour, kept reachable
+                // so a regression can be A/B'd against it.
+                Ok(0) => usize::MAX,
+                Ok(mb) => mb.saturating_mul(1024 * 1024),
+                Err(_) => DEFAULT_CAPACITY_BYTES,
+            },
+            Err(_) => DEFAULT_CAPACITY_BYTES,
+        };
+        Self {
+            enabled: false,
+            capturing: false,
+            free: HashMap::new(),
+            deferred: Vec::new(),
+            missed: std::collections::HashSet::new(),
+            cached_bytes: 0,
+            cached_buffers: 0,
+            capacity,
+            tick: 0,
+            hits: 0,
+            misses: 0,
+            puts: 0,
+            evicted: 0,
+            drained: 0,
+            high_water_bytes: 0,
+        }
+    }
+}
+
+impl AllocCache {
+    /// Take a buffer of exactly `bytes` from the cache, or `None`.
+    ///
+    /// Exact match only. The returned buffer is therefore always exactly the
+    /// requested size, which is the invariant `cached_bytes` accounting — and so
+    /// the capacity bound — depends on. See the type docs for why a size-class
+    /// match would break it.
+    fn take(&mut self, bytes: usize) -> Option<cudarc::driver::sys::CUdeviceptr> {
+        self.tick += 1;
+        let tick = self.tick;
+        // Note the shape: every path that does not return a buffer must count a
+        // miss, including "the size is known but its stack is empty". `?` on the
+        // lookup would skip the counter and make `misses` — the number this
+        // change is judged on — quietly wrong.
+        let hit = self
+            .free
+            .get_mut(&bytes)
+            .and_then(|sc| sc.ptrs.pop().inspect(|_| sc.tick = tick));
+        match hit {
+            Some(ptr) => {
+                self.cached_bytes -= bytes;
+                self.cached_buffers -= 1;
+                self.hits += 1;
+                Some(ptr)
+            }
+            None => {
+                self.misses += 1;
+                None
+            }
+        }
+    }
+
+    /// Park `ptr` (exactly `bytes` long) in the cache. Returns pointers the
+    /// caller must hand back to the driver: eviction victims, if this put
+    /// pushed retention over capacity.
+    fn put(
+        &mut self,
+        bytes: usize,
+        ptr: cudarc::driver::sys::CUdeviceptr,
+    ) -> Vec<cudarc::driver::sys::CUdeviceptr> {
+        self.tick += 1;
+        let tick = self.tick;
+        self.puts += 1;
+        if self.capturing {
+            self.deferred.push((bytes, ptr));
+        } else {
+            let sc = self.free.entry(bytes).or_default();
+            sc.ptrs.push(ptr);
+            sc.tick = tick;
+        }
+        self.cached_bytes += bytes;
+        self.cached_buffers += 1;
+        self.high_water_bytes = self.high_water_bytes.max(self.cached_bytes);
+        self.evict_if_over_capacity()
+    }
+
+    /// Free least-recently-used buffers until retention is back under the
+    /// low-water mark (7/8 of capacity, so a cache sitting exactly at the cap
+    /// does not evict on every single put).
+    ///
+    /// `deferred` is never evicted: those buffers were freed *during* a capture
+    /// and handing their addresses back to the driver mid-capture is precisely
+    /// the aliasing the deferral exists to prevent. Captures are short and
+    /// bounded, so nothing is lost by waiting.
+    fn evict_if_over_capacity(&mut self) -> Vec<cudarc::driver::sys::CUdeviceptr> {
+        if self.capacity == usize::MAX || self.cached_bytes <= self.capacity || self.capturing {
+            return Vec::new();
+        }
+        // Evict to 7/8 of capacity rather than exactly to it, so a cache sitting
+        // at the cap does not run this sweep on every single put.
+        let low_water = self.capacity / 8 * 7;
+        // Oldest size first.
+        let mut order: Vec<(u64, usize)> = self
+            .free
+            .iter()
+            .filter(|(_, sc)| !sc.ptrs.is_empty())
+            .map(|(bytes, sc)| (sc.tick, *bytes))
+            .collect();
+        order.sort_unstable();
+        let mut victims = Vec::new();
+        for (_, bytes) in order {
+            if self.cached_bytes <= low_water {
+                break;
+            }
+            let Some(sc) = self.free.get_mut(&bytes) else {
+                continue;
+            };
+            while self.cached_bytes > low_water {
+                match sc.ptrs.pop() {
+                    Some(p) => {
+                        victims.push(p);
+                        self.cached_bytes -= bytes;
+                        self.cached_buffers -= 1;
+                        self.evicted += 1;
+                    }
+                    None => break,
+                }
+            }
+        }
+        // Drop emptied sizes so the map does not grow without bound either — it
+        // is keyed by byte count, and those track KV length.
+        self.free.retain(|_, sc| !sc.ptrs.is_empty());
+        victims
+    }
+
+    /// Hand every retained buffer back. Used by `set_alloc_cache_enabled(false)`
+    /// and `drain_alloc_cache_and_free()`.
+    fn drain_all(&mut self) -> Vec<cudarc::driver::sys::CUdeviceptr> {
+        self.capturing = false;
+        let mut d = Vec::with_capacity(self.cached_buffers);
+        for (_, sc) in self.free.drain() {
+            d.extend(sc.ptrs);
+        }
+        d.extend(self.deferred.drain(..).map(|(_, p)| p));
+        self.drained += d.len() as u64;
+        self.cached_bytes = 0;
+        self.cached_buffers = 0;
+        d
+    }
+
+    fn stats(&self) -> AllocCacheStats {
+        AllocCacheStats {
+            hits: self.hits,
+            misses: self.misses,
+            puts: self.puts,
+            evicted: self.evicted,
+            drained: self.drained,
+            cached_bytes: self.cached_bytes,
+            cached_buffers: self.cached_buffers,
+            high_water_bytes: self.high_water_bytes,
+            capacity_bytes: self.capacity,
+            size_classes: self.free.values().filter(|sc| !sc.ptrs.is_empty()).count(),
+        }
+    }
+
+    /// Recount `cached_bytes`/`cached_buffers` from scratch. Only for tests —
+    /// the incremental counters are what the allocator actually uses, so a test
+    /// that recomputes them is the thing that proves they never drift.
+    #[cfg(test)]
+    fn recount(&self) -> (usize, usize) {
+        let mut bytes = 0;
+        let mut n = 0;
+        for (sz, sc) in self.free.iter() {
+            bytes += sz * sc.ptrs.len();
+            n += sc.ptrs.len();
+        }
+        for (b, _) in self.deferred.iter() {
+            bytes += b;
+            n += 1;
+        }
+        (bytes, n)
+    }
 }
 
 #[derive(Clone)]
@@ -83,10 +405,7 @@ impl CudaDevice {
             if enabled {
                 Vec::new()
             } else {
-                cache.capturing = false;
-                let mut d: Vec<_> = cache.free.drain().flat_map(|(_, v)| v).collect();
-                d.extend(cache.deferred.drain(..).map(|(_, p)| p));
-                d
+                cache.drain_all()
             }
         };
         // Free drained buffers outside the lock (upgrade -> Drop frees via cudarc).
@@ -97,6 +416,33 @@ impl CudaDevice {
 
     pub fn alloc_cache_enabled(&self) -> bool {
         self.alloc_cache.lock().unwrap().enabled
+    }
+
+    /// Counters for the caching allocator: driver allocations, driver frees,
+    /// bytes retained, high-water mark. Cheap enough to poll every decode step.
+    ///
+    /// `misses` is the number of real `cuMemAllocAsync` calls made while the
+    /// cache was on, and `frees()` the number of real `cuMemFreeAsync` calls it
+    /// caused. A cache that is working shows a low `misses` delta per step and a
+    /// **non-zero** `frees()` delta once it reaches capacity; a cache that is
+    /// leaking shows `frees() == 0` and `cached_bytes` climbing without bound.
+    pub fn alloc_cache_stats(&self) -> AllocCacheStats {
+        self.alloc_cache.lock().unwrap().stats()
+    }
+
+    /// Set the retention cap in bytes. `usize::MAX` disables the bound.
+    ///
+    /// Applied immediately: lowering it below current retention evicts down to
+    /// the new low-water mark before returning.
+    pub fn set_alloc_cache_capacity(&self, capacity_bytes: usize) {
+        let victims = {
+            let mut cache = self.alloc_cache.lock().unwrap();
+            cache.capacity = capacity_bytes;
+            cache.evict_if_over_capacity()
+        };
+        for ptr in victims {
+            drop(unsafe { self.stream.upgrade_device_ptr::<u8>(ptr, 0) });
+        }
     }
 
     /// Enter/leave capture mode. While in capture mode, freed buffers are parked
@@ -153,12 +499,9 @@ impl CudaDevice {
     pub fn drain_alloc_cache_and_free(&self) {
         let drained: Vec<cudarc::driver::sys::CUdeviceptr> = {
             let mut cache = self.alloc_cache.lock().unwrap();
-            cache.capturing = false;
-            let mut d: Vec<_> = cache.free.drain().flat_map(|(_, v)| v).collect();
-            d.extend(cache.deferred.drain(..).map(|(_, p)| p));
             // Sizes that missed before mean nothing once every buffer is gone.
             cache.missed.clear();
-            d
+            cache.drain_all()
         };
         // Free outside the lock (upgrade -> Drop frees via cudarc).
         for ptr in drained {
@@ -175,13 +518,29 @@ impl CudaDevice {
         if std::env::var_os("ARC_NO_DEFERRED_FREE").is_some() {
             return;
         }
-        let mut cache = self.alloc_cache.lock().unwrap();
-        cache.capturing = capturing;
-        if !capturing {
-            let deferred = std::mem::take(&mut cache.deferred);
-            for (bytes, ptr) in deferred {
-                cache.free.entry(bytes).or_default().push(ptr);
+        // Leaving capture returns the parked buffers to the free pool. That can
+        // put retention over capacity, so the eviction victims have to be freed
+        // here too — outside the lock.
+        let victims = {
+            let mut cache = self.alloc_cache.lock().unwrap();
+            cache.capturing = capturing;
+            if capturing {
+                Vec::new()
+            } else {
+                let deferred = std::mem::take(&mut cache.deferred);
+                // `deferred` was already counted in cached_bytes when it was
+                // parked; re-filing it must not double-count.
+                cache.cached_bytes -= deferred.iter().map(|(b, _)| *b).sum::<usize>();
+                cache.cached_buffers -= deferred.len();
+                let mut victims = Vec::new();
+                for (bytes, ptr) in deferred {
+                    victims.extend(cache.put(bytes, ptr));
+                }
+                victims
             }
+        };
+        for ptr in victims {
+            drop(unsafe { self.stream.upgrade_device_ptr::<u8>(ptr, 0) });
         }
     }
 
@@ -197,8 +556,10 @@ impl CudaDevice {
         if !cache.enabled {
             return None;
         }
-        let hit = cache.free.get_mut(&bytes).and_then(|v| v.pop());
-        if hit.is_none() && cache.missed.insert(bytes) {
+        let hit = cache.take(bytes);
+        // Keyed by size class, not byte count: the byte counts are unbounded
+        // (they track KV length) and this set used to grow with them.
+        if hit.is_none() && cache.missed.insert(bucket_index(bytes)) {
             if cache.capturing {
                 // A miss DURING capture means this size was not pre-warmed: the
                 // alloc becomes an unstable graph memory node -> launch fault or
@@ -208,7 +569,7 @@ impl CudaDevice {
                      (not pre-warmed) -> graph will be unstable. Grow warmup coverage."
                 );
             } else if std::env::var_os("ARC_CACHE_DEBUG").is_some() {
-                eprintln!("[alloc-cache] MISS new size {bytes} bytes -> cuMemAllocAsync");
+                eprintln!("[alloc-cache] MISS new size class for {bytes} bytes -> cuMemAllocAsync");
             }
         }
         hit
@@ -218,18 +579,26 @@ impl CudaDevice {
     /// caller must then free it normally). During capture the buffer is parked
     /// in `deferred` (not reusable until capture mode ends) to prevent
     /// within-capture aliasing.
+    ///
+    /// Accepting `ptr` may push retention over capacity, in which case the
+    /// least-recently-used buffers are freed here — which is the only reason
+    /// this cache ever hands memory back during steady-state decode. Returning
+    /// `true` therefore means "`ptr` is the cache's problem now", not "nothing
+    /// was freed".
     pub(crate) fn cache_put(&self, bytes: usize, ptr: cudarc::driver::sys::CUdeviceptr) -> bool {
         if bytes == 0 {
             return false;
         }
-        let mut cache = self.alloc_cache.lock().unwrap();
-        if !cache.enabled {
-            return false;
-        }
-        if cache.capturing {
-            cache.deferred.push((bytes, ptr));
-        } else {
-            cache.free.entry(bytes).or_default().push(ptr);
+        let victims = {
+            let mut cache = self.alloc_cache.lock().unwrap();
+            if !cache.enabled {
+                return false;
+            }
+            cache.put(bytes, ptr)
+        };
+        // Free outside the lock (upgrade -> Drop frees via cudarc).
+        for p in victims {
+            drop(unsafe { self.stream.upgrade_device_ptr::<u8>(p, 0) });
         }
         true
     }
@@ -982,5 +1351,225 @@ impl BackendDevice for CudaDevice {
     fn synchronize(&self) -> Result<()> {
         self.stream.synchronize().map_err(crate::Error::wrap)?;
         Ok(())
+    }
+}
+
+/// The caching allocator's bound, tested without a GPU.
+///
+/// `AllocCache` is pure host state — byte counts and `u64` pointer values — so
+/// everything that makes it *bounded* can be asserted here. That matters: before
+/// this module there were no tests of the allocator at all, in this repo or in
+/// the one that consumes it, because every path that exercised it needed a
+/// device.
+///
+/// These assert **counts**, not the absence of a crash. A cache that quietly
+/// declined to cache anything would satisfy "did not OOM"; it would not satisfy
+/// `hits == 3` or `frees() == 0 before the cap, > 0 after`.
+#[cfg(test)]
+mod alloc_cache_tests {
+    use super::*;
+
+    /// `ptr` values are opaque `u64`s to the cache — it never dereferences them
+    /// — so a counter stands in for the driver.
+    fn cache(capacity: usize) -> AllocCache {
+        let mut c = AllocCache::default();
+        c.enabled = true;
+        c.capacity = capacity;
+        c
+    }
+
+    const UNBOUNDED: usize = usize::MAX;
+
+    #[test]
+    fn a_put_then_a_take_of_the_same_size_is_a_hit() {
+        let mut c = cache(UNBOUNDED);
+        assert!(c.put(4096, 0x1000).is_empty());
+        assert_eq!(c.take(4096), Some(0x1000));
+        let s = c.stats();
+        assert_eq!((s.hits, s.misses, s.puts), (1, 0, 1));
+        assert_eq!(s.cached_bytes, 0, "the buffer left the cache");
+    }
+
+    /// The property the capacity bound rests on: a request is never served a
+    /// buffer that was allocated at a different size. If this ever fails, either
+    /// callers can overrun a short buffer, or `cached_bytes` stops matching the
+    /// bytes actually held and the cap stops bounding anything.
+    #[test]
+    fn a_different_size_is_never_served() {
+        let mut c = cache(UNBOUNDED);
+        c.put(4096, 0x1000);
+        assert_eq!(c.take(4097), None, "must not serve a larger request");
+        assert_eq!(c.take(4095), None, "must not serve a smaller request");
+        assert_eq!(c.take(8192), None);
+        assert_eq!(c.stats().misses, 3);
+        // The buffer is still there, untouched, for its own size.
+        assert_eq!(c.take(4096), Some(0x1000));
+    }
+
+    /// The defect this change exists to fix, in miniature: sizes that step
+    /// upward every call — as the KV-length-dependent buffers do — are never
+    /// reused, so an unbounded cache retains all of them and frees nothing.
+    #[test]
+    fn unbounded_growing_sizes_retain_everything_and_free_nothing() {
+        let mut c = cache(UNBOUNDED);
+        let mut expect = 0usize;
+        for step in 0..500u64 {
+            let bytes = 65536 + step as usize * 8192; // the measured V4 pattern
+            assert_eq!(c.take(bytes), None, "a never-seen size cannot hit");
+            c.put(bytes, 0x1_0000 + step);
+            expect += bytes;
+        }
+        let s = c.stats();
+        assert_eq!(s.frees(), 0, "this is the leak: nothing is ever freed");
+        assert_eq!(s.cached_bytes, expect);
+        assert_eq!(s.cached_buffers, 500);
+        assert_eq!(c.recount(), (s.cached_bytes, s.cached_buffers));
+    }
+
+    /// The fix. Same traffic, with a cap: retention stops at the cap and frees
+    /// become non-zero. Both halves are asserted — "did not grow" alone would
+    /// also be satisfied by a cache that never stored anything.
+    #[test]
+    fn a_capped_cache_bounds_retention_and_frees() {
+        const CAP: usize = 8 * 1024 * 1024;
+        let mut c = cache(CAP);
+        let mut freed = 0u64;
+        for step in 0..500u64 {
+            let bytes = 65536 + step as usize * 8192;
+            c.take(bytes);
+            freed += c.put(bytes, 0x1_0000 + step).len() as u64;
+            assert!(
+                c.stats().cached_bytes <= CAP,
+                "retention passed the cap at step {step}: {} > {CAP}",
+                c.stats().cached_bytes
+            );
+        }
+        let s = c.stats();
+        assert!(s.frees() > 0, "frees must be non-zero once the cap bites");
+        assert_eq!(s.frees(), freed, "every victim was handed to the caller");
+        assert_eq!(s.evicted, freed);
+        assert!(s.high_water_bytes <= CAP);
+        assert_eq!(c.recount(), (s.cached_bytes, s.cached_buffers));
+    }
+
+    /// Eviction must not evict the working set. A hot size touched every step
+    /// keeps a fresh tick, so it survives while the one-shot sizes around it are
+    /// reclaimed — otherwise the cap would cost the 3.73 ms/token the cache is
+    /// worth.
+    #[test]
+    fn eviction_keeps_the_hot_size_and_drops_the_cold_ones() {
+        const HOT: usize = 1024 * 1024;
+        let mut c = cache(4 * 1024 * 1024);
+        c.put(HOT, 0xAAAA);
+        for step in 0..400u64 {
+            // The hot buffer is taken and returned every step, as a per-layer
+            // activation would be.
+            let hot = c.take(HOT).expect("the hot size must stay resident");
+            c.put(HOT, hot);
+            // A cold, never-repeated size.
+            let cold = 65536 + step as usize * 8192;
+            c.take(cold);
+            c.put(cold, 0x2_0000 + step);
+        }
+        assert_eq!(c.stats().hits, 400, "every hot take hit");
+        assert!(c.stats().evicted > 0, "the cold sizes were reclaimed");
+    }
+
+    /// Capacity 0 is a legitimate setting — cache nothing — and must not park a
+    /// buffer it has no room for. Guards against an off-by-one that would retain
+    /// one buffer per put forever.
+    #[test]
+    fn zero_capacity_retains_nothing() {
+        let mut c = cache(0);
+        let victims = c.put(4096, 0x1000);
+        assert_eq!(victims, vec![0x1000]);
+        assert_eq!(c.stats().cached_bytes, 0);
+        assert_eq!(c.stats().cached_buffers, 0);
+        assert_eq!(c.take(4096), None);
+    }
+
+    /// Draining hands back every buffer exactly once and zeroes the accounting.
+    /// A drain that lost a pointer would leak it past the process's own
+    /// bookkeeping, where nothing could ever find it again.
+    #[test]
+    fn drain_returns_every_buffer_once_and_zeroes_the_accounting() {
+        let mut c = cache(UNBOUNDED);
+        for i in 0..64u64 {
+            c.put(4096 + (i as usize % 8) * 512, 0x3_0000 + i);
+        }
+        c.capturing = true;
+        for i in 0..16u64 {
+            c.put(2048, 0x4_0000 + i);
+        }
+        let mut drained = c.drain_all();
+        assert_eq!(drained.len(), 80, "64 free + 16 deferred");
+        drained.sort_unstable();
+        drained.dedup();
+        assert_eq!(drained.len(), 80, "no pointer handed back twice");
+        let s = c.stats();
+        assert_eq!((s.cached_bytes, s.cached_buffers), (0, 0));
+        assert_eq!(s.drained, 80);
+        assert_eq!(c.recount(), (0, 0));
+    }
+
+    /// During capture, frees are parked rather than recycled — re-serving an
+    /// address inside one capture records two graph uses of it — but they still
+    /// count against retention, and the cap must not evict them: those addresses
+    /// may be baked into the graph being recorded.
+    #[test]
+    fn capture_parks_buffers_and_never_evicts_them() {
+        let mut c = cache(64 * 1024);
+        c.capturing = true;
+        for i in 0..64u64 {
+            let victims = c.put(65536, 0x5_0000 + i);
+            assert!(victims.is_empty(), "capture must not evict");
+        }
+        let s = c.stats();
+        assert_eq!(s.cached_buffers, 64);
+        assert_eq!(s.cached_bytes, 64 * 65536);
+        assert!(s.cached_bytes > s.capacity_bytes, "over the cap, deliberately");
+        assert_eq!(s.evicted, 0);
+        // Nothing parked is reusable until capture ends.
+        assert_eq!(c.take(65536), None);
+    }
+
+    /// Sizes are the map's keys and they track KV length, so an emptied size
+    /// must not leave its key behind — that is a host-side leak with the same
+    /// unbounded shape as the device-side one.
+    #[test]
+    fn emptied_sizes_are_dropped_from_the_map() {
+        let mut c = cache(1024 * 1024);
+        for step in 0..2000u64 {
+            let bytes = 4096 + step as usize * 512;
+            c.put(bytes, 0x6_0000 + step);
+        }
+        assert!(
+            c.free.len() < 600,
+            "the size map grew unbounded: {} keys",
+            c.free.len()
+        );
+        assert_eq!(c.stats().size_classes, c.free.len());
+    }
+
+    /// The `missed` diagnostic set is keyed by size class, not byte count, so it
+    /// is bounded by the ladder (221 classes) no matter how many distinct sizes
+    /// go through it.
+    #[test]
+    fn size_classes_are_monotonic_and_few() {
+        let mut last = 0;
+        for bytes in [0usize, 1, 511, 512, 513, 640, 768, 1023, 1024, 1 << 20] {
+            let b = bucket_index(bytes);
+            assert!(b >= last, "not monotonic at {bytes}");
+            last = b;
+        }
+        assert_eq!(bucket_index(0), bucket_index(511), "tiny is one class");
+        assert!(bucket_index(512) > bucket_index(511));
+        // 512..=usize::MAX spans 4 classes per octave, plus the tiny class.
+        let top = bucket_index(usize::MAX);
+        assert!(top < 256, "ladder is small and fixed: {top}");
+        // The pattern that caused the leak collapses to few classes.
+        let classes: std::collections::HashSet<usize> =
+            (0..2000).map(|s| bucket_index(65536 + s * 8192)).collect();
+        assert!(classes.len() < 32, "{} classes for 2000 sizes", classes.len());
     }
 }
