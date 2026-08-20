@@ -3,9 +3,11 @@ use crate::{CpuStorage, CpuStorageRef, DType, Layout, Result, Shape};
 pub use candle_kernels as kernels;
 pub use cudarc;
 use cudarc::driver::CudaFunction;
-// `stream_synced_slice` is a `HostSlice` method; the trait must be in scope for
-// the capture-time source retention in `clone_htod`/`memcpy_htod`.
-use cudarc::driver::HostSlice as _;
+// NOTE: `HostSlice` is deliberately NOT imported. Bringing it into scope makes
+// its `len` method compete with the inherent `[T]::len` at every call site in
+// this file, including `kernels::ALL_IDS.len()` in const position -- which stops
+// compiling, because a trait method is not const. `stream_synced_slice` is
+// called through its fully-qualified path instead.
 use float8::F8E4M3;
 use half::{bf16, f16};
 use std::collections::HashMap;
@@ -512,7 +514,10 @@ impl CudaDevice {
     }
 
     pub fn memcpy_htod<
-        T: cudarc::driver::DeviceRepr,
+        // `'static`: capture-time sources are retained for the life of the graph,
+        // which outlives any borrow. Every `DeviceRepr` is a concrete POD, so
+        // this bound excludes nothing that could reach here.
+        T: cudarc::driver::DeviceRepr + 'static,
         Src: cudarc::driver::HostSlice<T> + ?Sized,
         Dst: cudarc::driver::DevicePtrMut<T>,
     >(
@@ -523,7 +528,8 @@ impl CudaDevice {
         // While capturing, the copy is recorded against the HOST pointer and
         // re-read on every replay -- see `arc_capture_retain_host`.
         if self.capture_mode() {
-            let (s, _guard) = unsafe { src.stream_synced_slice(&self.stream) };
+            let (s, _guard) =
+                unsafe { cudarc::driver::HostSlice::stream_synced_slice(src, &self.stream) };
             let retained = arc_capture_retain_host(s);
             return self.stream.memcpy_htod(retained, dst).w();
         }
@@ -561,7 +567,10 @@ impl CudaDevice {
         self.stream.memcpy_dtoh(src, dst).w()
     }
 
-    pub fn clone_htod<T: cudarc::driver::DeviceRepr, Src: cudarc::driver::HostSlice<T> + ?Sized>(
+    pub fn clone_htod<
+        T: cudarc::driver::DeviceRepr + 'static,
+        Src: cudarc::driver::HostSlice<T> + ?Sized,
+    >(
         &self,
         src: &Src,
     ) -> Result<cudarc::driver::CudaSlice<T>> {
@@ -584,7 +593,8 @@ impl CudaDevice {
         let len = cudarc::driver::HostSlice::len(src);
         let mut dst = unsafe { self.alloc::<T>(len)? };
         if self.capture_mode() {
-            let (s, _guard) = unsafe { src.stream_synced_slice(&self.stream) };
+            let (s, _guard) =
+                unsafe { cudarc::driver::HostSlice::stream_synced_slice(src, &self.stream) };
             let retained = arc_capture_retain_host(s);
             self.stream.memcpy_htod(retained, &mut dst).w()?;
             return Ok(dst);
