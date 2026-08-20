@@ -107,6 +107,74 @@ pub fn arc_capture_retain_host<T>(src: &[T]) -> &'static [T] {
     }
 }
 
+/// Capture-time device->host copies observed. See [`arc_capture_clone_dtoh`].
+static ARC_CAPTURE_DTOH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Number of device->host copies issued while a graph capture was open.
+///
+/// Should be ZERO. Any non-zero value names a real defect: the captured forward
+/// is reading a device value back to the host, which a graph cannot do.
+pub fn arc_capture_dtoh_count() -> u64 {
+    ARC_CAPTURE_DTOH.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// `clone_dtoh` that cannot corrupt the host heap when issued during capture.
+///
+/// # Why (RUN-161 / ArcGraph)
+///
+/// `CudaStream::clone_dtoh` allocates a `Vec`, issues `cuMemcpyDtoHAsync` into
+/// it, and returns **without synchronising**. Under `cuStreamBeginCapture` that
+/// copy is recorded as a graph MEMCPY node whose *destination* is that `Vec`'s
+/// heap buffer. The `Vec` is dropped as soon as the caller is done with it, so
+/// every `cuGraphLaunch` afterwards has the driver **writing into freed heap
+/// memory** — which is why the failure is `malloc_consolidate(): invalid chunk
+/// size` on a later allocation, and `CUDA_ERROR_ILLEGAL_ADDRESS` when the page
+/// has already been returned to the OS.
+///
+/// This is the mirror image of the host-source problem that
+/// [`arc_capture_retain_host`] fixes, and it is the more destructive half: a
+/// dangling *source* is only read, a dangling *destination* is written.
+///
+/// Note it does not fail capture the way a host round trip normally would,
+/// because it never synchronises — so it is invisible to any "blocking D2H per
+/// step" count. It has to be counted directly.
+///
+/// During capture the copy is redirected into a leaked buffer and the caller
+/// gets uninitialised storage. That loses nothing: capture *records*, it does
+/// not execute, so the caller's bytes were never meaningful on this pass. The
+/// graph's replay output is separately gated against an eager forward before it
+/// is trusted, so a forward that really does depend on a host readback is
+/// caught there rather than silently returning garbage.
+pub fn arc_capture_clone_dtoh<T: cudarc::driver::DeviceRepr + 'static>(
+    dev: &CudaDevice,
+    slice: &cudarc::driver::CudaSlice<T>,
+) -> Result<Vec<T>> {
+    let stream = slice.stream();
+    if !dev.capture_mode() {
+        return stream.clone_dtoh(slice).w();
+    }
+    let n = slice.len();
+    ARC_CAPTURE_DTOH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    eprintln!(
+        "[arc-dtoh] WARNING: device->host copy of {n} x {} issued while a graph capture is \
+         open. The captured graph would write into a freed host Vec on every replay; \
+         redirecting to a leaked buffer. Set ARC_HTOD_TRACE=1 for the call site.",
+        std::any::type_name::<T>()
+    );
+    if std::env::var_os("ARC_HTOD_TRACE").is_some() {
+        eprintln!("{}", std::backtrace::Backtrace::force_capture());
+    }
+    // SAFETY: `T: DeviceRepr` is POD, and this mirrors what `clone_dtoh` itself
+    // does (`with_capacity` + `set_len`) before overwriting via memcpy.
+    let mut shadow: Vec<T> = Vec::with_capacity(n);
+    unsafe { shadow.set_len(n) };
+    let shadow: &'static mut [T] = Box::leak(shadow.into_boxed_slice());
+    stream.memcpy_dtoh(slice, shadow).w()?;
+    let mut out: Vec<T> = Vec::with_capacity(n);
+    unsafe { out.set_len(n) };
+    Ok(out)
+}
+
 /// Unique identifier for cuda devices.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct DeviceId(usize);
