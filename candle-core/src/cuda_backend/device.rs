@@ -55,7 +55,32 @@ pub struct AllocCache {
     /// Debug: byte-sizes that have missed the cache (logged once each under
     /// ARC_CACHE_DEBUG). A new miss DURING capture = an allocation that becomes
     /// an unstable graph memory node -> the cause of the launch fault/corruption.
+    ///
+    /// This set is a LOG DEDUP, not a diagnostic. It silences the second miss of
+    /// a size, so a size that first missed during a harmless deferred-free warm
+    /// pass stays silent when it misses again during the real capture. Never
+    /// gate a correctness check on it -- use `capture_misses`.
     missed: std::collections::HashSet<usize>,
+    /// Per-size allocation demand of ONE capture-mode forward.
+    ///
+    /// `window` counts allocations of the capture-mode window currently open;
+    /// closing the window folds it into `demand` with a per-size max. Because
+    /// frees are deferred while capturing, the demand of a size is the window's
+    /// TOTAL allocation count, not its peak-live count -- serving a captured
+    /// forward needs one distinct buffer per allocation.
+    ///
+    /// The max over windows matters: buffers whose width cycles with a period
+    /// (the V4 rolling-compressor tail cycles through `ratio` consecutive
+    /// widths) present a DIFFERENT size on each step, so a single warm pass sees
+    /// only one of them. Running `ratio` warm windows and taking the union of
+    /// sizes with the max of counts covers the whole cycle.
+    window: HashMap<usize, usize>,
+    demand: HashMap<usize, usize>,
+    /// Misses observed while `capturing`, since the last `reset_capture_misses`.
+    /// Counted, never deduped: a miss during the real capture is an allocation
+    /// served from the graph's private pool, i.e. an unstable graph memory node,
+    /// i.e. CUDA_ERROR_ILLEGAL_ADDRESS on `cuGraphLaunch`. One is fatal.
+    capture_misses: HashMap<usize, usize>,
 }
 
 #[derive(Clone)]
@@ -84,6 +109,11 @@ impl CudaDevice {
                 Vec::new()
             } else {
                 cache.capturing = false;
+                // The open window described a pool that is about to stop
+                // existing; folding it into the profile would record a demand
+                // no buffer here can serve. `demand` itself survives: it is a
+                // fact about the model's shapes, not about this pool.
+                cache.window.clear();
                 let mut d: Vec<_> = cache.free.drain().flat_map(|(_, v)| v).collect();
                 d.extend(cache.deferred.drain(..).map(|(_, p)| p));
                 d
@@ -154,6 +184,7 @@ impl CudaDevice {
         let drained: Vec<cudarc::driver::sys::CUdeviceptr> = {
             let mut cache = self.alloc_cache.lock().unwrap();
             cache.capturing = false;
+            cache.window.clear();
             let mut d: Vec<_> = cache.free.drain().flat_map(|(_, v)| v).collect();
             d.extend(cache.deferred.drain(..).map(|(_, p)| p));
             // Sizes that missed before mean nothing once every buffer is gone.
@@ -177,12 +208,115 @@ impl CudaDevice {
         }
         let mut cache = self.alloc_cache.lock().unwrap();
         cache.capturing = capturing;
-        if !capturing {
+        if capturing {
+            cache.window.clear();
+        } else {
+            let window = std::mem::take(&mut cache.window);
+            for (bytes, n) in window {
+                let slot = cache.demand.entry(bytes).or_insert(0);
+                *slot = (*slot).max(n);
+            }
             let deferred = std::mem::take(&mut cache.deferred);
             for (bytes, ptr) in deferred {
                 cache.free.entry(bytes).or_default().push(ptr);
             }
         }
+    }
+
+    /// Per-size allocation demand of one capture-mode forward, `(bytes, count)`,
+    /// as observed over every capture-mode window so far. Sorted by size.
+    pub fn capture_alloc_demand(&self) -> Vec<(usize, usize)> {
+        let cache = self.alloc_cache.lock().unwrap();
+        let mut v: Vec<(usize, usize)> = cache.demand.iter().map(|(&b, &n)| (b, n)).collect();
+        v.sort_unstable();
+        v
+    }
+
+    /// Clear the capture-miss ledger. Call immediately before entering the real
+    /// capture so the count that follows describes that capture and nothing else.
+    pub fn reset_capture_misses(&self) {
+        self.alloc_cache.lock().unwrap().capture_misses.clear();
+    }
+
+    /// `(bytes, count)` for every size that missed the cache while capturing,
+    /// since the last `reset_capture_misses`. Sorted by size.
+    pub fn capture_misses(&self) -> Vec<(usize, usize)> {
+        let cache = self.alloc_cache.lock().unwrap();
+        let mut v: Vec<(usize, usize)> =
+            cache.capture_misses.iter().map(|(&b, &n)| (b, n)).collect();
+        v.sort_unstable();
+        v
+    }
+
+    /// Total capture-mode misses since the last `reset_capture_misses`.
+    /// Non-zero after a capture forward means the graph has at least one
+    /// unstable memory node and MUST NOT be instantiated.
+    pub fn capture_miss_count(&self) -> usize {
+        self.alloc_cache
+            .lock()
+            .unwrap()
+            .capture_misses
+            .values()
+            .sum()
+    }
+
+    /// Grow the free pool so that every size in the observed demand profile can
+    /// be served `demand + slack` times without touching the driver.
+    ///
+    /// This is the pre-warm the capture protocol's step 3 approximates. Step 3
+    /// leaves `free[S]` at the demand of the ONE step it ran; any size whose
+    /// demand is higher on the step that gets captured -- or that only appears
+    /// on that step -- misses, and a capture-time miss is served from the
+    /// graph's private pool as an unstable memory node. Topping up from the
+    /// profile closes both gaps, and `slack` absorbs a step that allocates a
+    /// little more than any observed one.
+    ///
+    /// Returns `(sizes_topped_up, buffers_allocated)`. Call with capture mode
+    /// OFF: a buffer released while capturing parks in `deferred` and cannot be
+    /// served, so pre-warming inside a capture window warms nothing.
+    pub fn prewarm_alloc_cache(&self, slack: usize) -> Result<(usize, usize)> {
+        // Decide under the lock, allocate outside it: cuMemAllocAsync is slow
+        // enough that holding the allocator mutex across it would serialise
+        // every other thread's allocations behind the pre-warm.
+        let todo: Vec<(usize, usize)> = {
+            let cache = self.alloc_cache.lock().unwrap();
+            if !cache.enabled {
+                return Ok((0, 0));
+            }
+            cache
+                .demand
+                .iter()
+                .filter_map(|(&bytes, &need)| {
+                    let have = cache.free.get(&bytes).map_or(0, |v| v.len());
+                    let want = need + slack;
+                    (bytes > 0 && want > have).then_some((bytes, want - have))
+                })
+                .collect()
+        };
+        let mut buffers = 0usize;
+        let mut sizes = 0usize;
+        for (bytes, n) in todo {
+            let mut made = Vec::with_capacity(n);
+            for _ in 0..n {
+                // Straight to the driver: `self.alloc` would consult the cache
+                // and hand back a buffer that is already in it.
+                let slice = unsafe { self.stream.alloc::<u8>(bytes) }.w()?;
+                made.push(slice.leak());
+            }
+            let mut cache = self.alloc_cache.lock().unwrap();
+            buffers += made.len();
+            sizes += 1;
+            cache.free.entry(bytes).or_default().extend(made);
+        }
+        Ok((sizes, buffers))
+    }
+
+    /// `(bytes, buffers_available)` for the free pool. Diagnostic only.
+    pub fn alloc_cache_free_counts(&self) -> Vec<(usize, usize)> {
+        let cache = self.alloc_cache.lock().unwrap();
+        let mut v: Vec<(usize, usize)> = cache.free.iter().map(|(&b, v)| (b, v.len())).collect();
+        v.sort_unstable();
+        v
     }
 
     pub fn capture_mode(&self) -> bool {
@@ -197,7 +331,17 @@ impl CudaDevice {
         if !cache.enabled {
             return None;
         }
+        if cache.capturing {
+            // Demand accounting for the window currently open. Counted before
+            // the lookup so a hit and a miss weigh the same: what the pre-warm
+            // must supply is the number of allocations, not the number of
+            // failures to serve them.
+            *cache.window.entry(bytes).or_insert(0) += 1;
+        }
         let hit = cache.free.get_mut(&bytes).and_then(|v| v.pop());
+        if hit.is_none() && cache.capturing {
+            *cache.capture_misses.entry(bytes).or_insert(0) += 1;
+        }
         if hit.is_none() && cache.missed.insert(bytes) {
             if cache.capturing {
                 // A miss DURING capture means this size was not pre-warmed: the
