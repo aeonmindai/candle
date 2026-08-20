@@ -17,6 +17,9 @@ mod device;
 mod error;
 mod utils;
 pub use device::{CudaDevice, DeviceId};
+// ArcGraph capture safety: the counter callers assert on, and the retention
+// helper itself. See `device::arc_capture_retain_host`.
+pub use device::{arc_capture_htod_retained, arc_capture_retain_host};
 pub use error::{CudaError, WrapErr};
 pub use utils::{Map1, Map1Any, Map2, Map2Any, Map2InPlace, Map3, S};
 
