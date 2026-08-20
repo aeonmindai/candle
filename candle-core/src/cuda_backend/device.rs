@@ -3,12 +3,107 @@ use crate::{CpuStorage, CpuStorageRef, DType, Layout, Result, Shape};
 pub use candle_kernels as kernels;
 pub use cudarc;
 use cudarc::driver::CudaFunction;
+// `stream_synced_slice` is a `HostSlice` method; the trait must be in scope for
+// the capture-time source retention in `clone_htod`/`memcpy_htod`.
+use cudarc::driver::HostSlice as _;
 use float8::F8E4M3;
 use half::{bf16, f16};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 
 use super::{CudaError, CudaStorage, CudaStorageSlice, WrapErr};
+
+/// Capture-time host->device copies that had their source retained, since
+/// process start. See [`arc_capture_retain_host`].
+static ARC_CAPTURE_HTOD_RETAINED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// Bytes retained by [`arc_capture_retain_host`].
+static ARC_CAPTURE_HTOD_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `(count, bytes)` of capture-time H2D sources retained so far.
+///
+/// This is the honest answer to "did the capture-safety fix do anything this
+/// run": a run where the fix never fired reports `(0, 0)`, which is a different
+/// statement from "capture succeeded". Assert on it; do not infer it.
+pub fn arc_capture_htod_retained() -> (u64, u64) {
+    use std::sync::atomic::Ordering;
+    (
+        ARC_CAPTURE_HTOD_RETAINED.load(Ordering::Relaxed),
+        ARC_CAPTURE_HTOD_BYTES.load(Ordering::Relaxed),
+    )
+}
+
+/// Retain the HOST source of a host->device copy **forever**, returning a
+/// `'static` alias of the same bytes.
+///
+/// # Why (RUN-161 / ArcGraph)
+///
+/// `CudaStream::memcpy_htod` is `cuMemcpyHtoDAsync(dst, host_ptr, n, stream)`.
+/// Under `cuStreamBeginCapture` that call is **recorded, not executed**: the
+/// resulting graph gains a MEMCPY node that stores the *host pointer* and
+/// dereferences it on the first `cuGraphLaunch` and on every replay afterwards.
+///
+/// Everything that builds a tensor from host data — `Tensor::new`,
+/// `from_vec`, `from_slice`, `arange`, `full`, and every `CpuStorage` that
+/// reaches [`CudaDevice::clone_htod`] — materialises its payload in a transient
+/// `Vec` that is dropped as soon as the expression returns. By the time the
+/// graph launches, that host allocation has been returned to the allocator and
+/// very often unmapped, so the driver's launch-time validation of the node's
+/// source region fails **synchronously**: `cuGraphLaunch` returns 700
+/// (`CUDA_ERROR_ILLEGAL_ADDRESS`) on an otherwise clean context, before any
+/// kernel runs. That synchronous-700-on-a-clean-context signature is the
+/// fingerprint of this bug and is what distinguishes it from a device-side
+/// fault, which would surface asynchronously at the next sync.
+///
+/// [`CudaDevice::htod_info`] already applied exactly this fix, but only for
+/// kernel dims/strides. Nothing protected `clone_htod`/`memcpy_htod`, which is
+/// the path every host-built tensor takes. This closes that gap for all of
+/// them at once, so a site the manual sweep missed is covered too.
+///
+/// Bounded by construction: it only runs while `capture_mode()` is set, which is
+/// a handful of forwards per process, and the payloads are index/position
+/// vectors of at most a few KB.
+pub fn arc_capture_retain_host<T>(src: &[T]) -> &'static [T] {
+    use std::sync::atomic::Ordering;
+    if src.is_empty() {
+        return &[];
+    }
+    let bytes = std::mem::size_of_val(src);
+    ARC_CAPTURE_HTOD_RETAINED.fetch_add(1, Ordering::Relaxed);
+    ARC_CAPTURE_HTOD_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+    // A capture-time H2D of this size is not an index vector -- it is bulk data
+    // that has no business inside the captured region. Retain it anyway (a
+    // correct-but-fat graph beats a faulting one) but say so, loudly.
+    if bytes > 1 << 20 {
+        eprintln!(
+            "[arc-htod] WARNING: retaining {bytes} B of host memory for a capture-time \
+             H2D copy -- a payload this large inside the captured region is a bug"
+        );
+    }
+    if std::env::var_os("ARC_HTOD_TRACE").is_some() {
+        eprintln!(
+            "[arc-htod] capture-time H2D retained: {bytes} B ({} x {})\n{}",
+            src.len(),
+            std::any::type_name::<T>(),
+            std::backtrace::Backtrace::force_capture()
+        );
+    }
+    // SAFETY: callers bound `T: DeviceRepr`, i.e. a plain-old-data type that is
+    // valid to memcpy to the device. Copying its bytes into a fresh allocation
+    // with the identical layout therefore yields a valid `[T]`. The allocation
+    // is never freed, which is the point: the graph node reads it on every
+    // replay for the lifetime of the process.
+    unsafe {
+        let layout = std::alloc::Layout::from_size_align(bytes, std::mem::align_of::<T>())
+            .expect("arc_capture_retain_host: invalid layout");
+        let p = std::alloc::alloc(layout) as *mut T;
+        if p.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        std::ptr::copy_nonoverlapping(src.as_ptr(), p, src.len());
+        std::slice::from_raw_parts(p, src.len())
+    }
+}
 
 /// Unique identifier for cuda devices.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -425,6 +520,13 @@ impl CudaDevice {
         src: &Src,
         dst: &mut Dst,
     ) -> Result<()> {
+        // While capturing, the copy is recorded against the HOST pointer and
+        // re-read on every replay -- see `arc_capture_retain_host`.
+        if self.capture_mode() {
+            let (s, _guard) = unsafe { src.stream_synced_slice(&self.stream) };
+            let retained = arc_capture_retain_host(s);
+            return self.stream.memcpy_htod(retained, dst).w();
+        }
         self.stream.memcpy_htod(src, dst).w()
     }
 
@@ -472,8 +574,21 @@ impl CudaDevice {
         // deferred-free address; the small htod copy itself is graph-safe (the
         // driver stages tiny host->device copies into the graph). When the cache
         // is OFF this is identical to alloc + memcpy (no behavior change).
+        //
+        // Allocating from the cache fixes the DEVICE side. The HOST side needs
+        // the same treatment: a captured `cuMemcpyHtoDAsync` records the source
+        // POINTER, and every host-built tensor (`Tensor::{new,from_vec,
+        // from_slice,arange,full}` -> `storage_from_cpu_storage` -> here) hands
+        // it a `Vec` that dies with the expression. That is a synchronous 700
+        // out of the first `cuGraphLaunch`. See `arc_capture_retain_host`.
         let len = cudarc::driver::HostSlice::len(src);
         let mut dst = unsafe { self.alloc::<T>(len)? };
+        if self.capture_mode() {
+            let (s, _guard) = unsafe { src.stream_synced_slice(&self.stream) };
+            let retained = arc_capture_retain_host(s);
+            self.stream.memcpy_htod(retained, &mut dst).w()?;
+            return Ok(dst);
+        }
         self.stream.memcpy_htod(src, &mut dst).w()?;
         Ok(dst)
     }
@@ -496,7 +611,9 @@ impl CudaDevice {
     ) -> Result<super::InfoBuf<T>> {
         let mut dst = unsafe { self.alloc::<T>(src.len())? };
         if self.capture_mode() {
-            let leaked: &'static [T] = Vec::leak(src.to_vec());
+            // Same retention as every other capture-time H2D, through the one
+            // helper, so `arc_capture_htod_retained` counts all of them.
+            let leaked = arc_capture_retain_host(src);
             self.stream.memcpy_htod(leaked, &mut dst).w()?;
         } else {
             self.stream.memcpy_htod(src, &mut dst).w()?;
