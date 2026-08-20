@@ -159,7 +159,7 @@ impl crate::CustomOp1 for ArgSort {
         let dev = storage.device();
         let slice = self.map(&storage.slice, dev, layout)?;
         let dst = crate::cuda_backend::CudaStorage {
-            slice,
+            slice: std::mem::ManuallyDrop::new(slice),
             device: dev.clone(),
         };
         Ok((dst, layout.shape().clone()))

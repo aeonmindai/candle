@@ -46,6 +46,7 @@ impl TryFrom<st::Dtype> for DType {
         match value {
             st::Dtype::U8 => Ok(DType::U8),
             st::Dtype::U32 => Ok(DType::U32),
+            st::Dtype::I8 => Ok(DType::I32), // I8 will be cast to I32 during load
             st::Dtype::I16 => Ok(DType::I16),
             st::Dtype::I32 => Ok(DType::I32),
             st::Dtype::I64 => Ok(DType::I64),
@@ -249,7 +250,7 @@ impl Tensor {
                             _ => unreachable!(),
                         };
                         let storage = crate::cuda_backend::CudaStorage {
-                            slice,
+                            slice: std::mem::ManuallyDrop::new(slice),
                             device: device.clone(),
                         };
                         Storage::Cuda(storage)
@@ -291,6 +292,10 @@ fn convert(view: &st::TensorView<'_>, device: &Device) -> Result<Tensor> {
             convert_with_cast_::<u16, u32, _>(view, device, conv)
         }
         st::Dtype::U32 => convert_::<u32>(view, device),
+        st::Dtype::I8 => {
+            let conv = |x: i8| Ok(x as i32);
+            convert_with_cast_::<i8, i32, _>(view, device, conv)
+        }
         st::Dtype::I16 => convert_::<i16>(view, device),
         st::Dtype::I32 => convert_::<i32>(view, device),
         st::Dtype::I64 => convert_::<i64>(view, device),
@@ -299,10 +304,12 @@ fn convert(view: &st::TensorView<'_>, device: &Device) -> Result<Tensor> {
         st::Dtype::F32 => convert_::<f32>(view, device),
         st::Dtype::F64 => convert_::<f64>(view, device),
         st::Dtype::F8_E4M3 => convert_::<float8::F8E4M3>(view, device),
-        st::Dtype::F6_E2M3 | st::Dtype::F6_E3M2 | st::Dtype::F4 | st::Dtype::F8_E8M0 => {
-            // For dummy types, we need to handle loading by creating a dummy tensor
-            // Since these types don't have actual data representation, we'll create
-            // a tensor that indicates it's a dummy type
+        st::Dtype::F8_E8M0 => {
+            // E8M0: 8-bit exponent, no mantissa. Value = 2^(byte - 127).
+            let conv = |x: u8| Ok(f32::from_bits((x as u32) << 23));
+            convert_with_cast_::<u8, f32, _>(view, device, conv)
+        }
+        st::Dtype::F6_E2M3 | st::Dtype::F6_E3M2 | st::Dtype::F4 => {
             convert_dummy(view, device)
         }
         dtype => Err(Error::UnsupportedSafeTensorDtype(dtype)),
@@ -349,7 +356,7 @@ fn convert_dummy(view: &st::TensorView<'_>, device: &Device) -> Result<Tensor> {
                 _ => unreachable!(),
             };
             let storage = crate::cuda_backend::CudaStorage {
-                slice,
+                slice: std::mem::ManuallyDrop::new(slice),
                 device: device.clone(),
             };
             Storage::Cuda(storage)

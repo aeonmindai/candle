@@ -608,7 +608,7 @@ impl QCudaStorage {
 
     pub fn quantize(&mut self, src: &CudaStorage) -> Result<()> {
         // Run the quantization on cpu.
-        let src = match &src.slice {
+        let src = match &*src.slice {
             crate::cuda_backend::CudaStorageSlice::F32(data) => self.device.clone_dtoh(data)?,
             _ => crate::bail!("only f32 can be quantized"),
         };
@@ -636,7 +636,7 @@ impl QCudaStorage {
         n_per_row: usize,
     ) -> Result<()> {
         // Run the quantization on cpu.
-        let src = match &src.slice {
+        let src = match &*src.slice {
             crate::cuda_backend::CudaStorageSlice::F32(data) => self.device.clone_dtoh(data)?,
             _ => crate::bail!("only f32 can be quantized"),
         };

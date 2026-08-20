@@ -147,7 +147,7 @@ impl candle::CustomOp3 for RotaryEmbI {
         use candle::backend::BackendStorage;
         use candle::cuda_backend::CudaStorageSlice::{BF16, F16, F32, F64};
         let dev = s1.device();
-        let slice = match (&s1.slice, &s2.slice, &s3.slice) {
+        let slice = match (&*s1.slice, &*s2.slice, &*s3.slice) {
             (BF16(s1), BF16(s2), BF16(s3)) => BF16(inner(s1, l1, s2, l2, s3, l3, dev)?),
             (F16(s1), F16(s2), F16(s3)) => F16(inner(s1, l1, s2, l2, s3, l3, dev)?),
             (F32(s1), F32(s2), F32(s3)) => F32(inner(s1, l1, s2, l2, s3, l3, dev)?),
@@ -160,7 +160,7 @@ impl candle::CustomOp3 for RotaryEmbI {
             ),
         };
         let dst = candle::cuda_backend::CudaStorage {
-            slice,
+            slice: std::mem::ManuallyDrop::new(slice),
             device: dev.clone(),
         };
         Ok((dst, l1.shape().clone()))
@@ -430,7 +430,7 @@ impl candle::CustomOp3 for RotaryEmb {
         use candle::backend::BackendStorage;
         use candle::cuda_backend::CudaStorageSlice::{BF16, F16, F32, F64};
         let dev = s1.device();
-        let slice = match (&s1.slice, &s2.slice, &s3.slice) {
+        let slice = match (&*s1.slice, &*s2.slice, &*s3.slice) {
             (BF16(s1), BF16(s2), BF16(s3)) => BF16(inner(s1, l1, s2, l2, s3, l3, dev)?),
             (F16(s1), F16(s2), F16(s3)) => F16(inner(s1, l1, s2, l2, s3, l3, dev)?),
             (F32(s1), F32(s2), F32(s3)) => F32(inner(s1, l1, s2, l2, s3, l3, dev)?),
@@ -443,7 +443,7 @@ impl candle::CustomOp3 for RotaryEmb {
             ),
         };
         let dst = candle::cuda_backend::CudaStorage {
-            slice,
+            slice: std::mem::ManuallyDrop::new(slice),
             device: dev.clone(),
         };
         Ok((dst, l1.shape().clone()))
@@ -700,7 +700,7 @@ impl candle::CustomOp3 for RotaryEmbThd {
         use candle::backend::BackendStorage;
         use candle::cuda_backend::CudaStorageSlice::{BF16, F16, F32, F64};
         let dev = s1.device();
-        let slice = match (&s1.slice, &s2.slice, &s3.slice) {
+        let slice = match (&*s1.slice, &*s2.slice, &*s3.slice) {
             (BF16(s1), BF16(s2), BF16(s3)) => BF16(inner(s1, l1, s2, l2, s3, l3, dev)?),
             (F16(s1), F16(s2), F16(s3)) => F16(inner(s1, l1, s2, l2, s3, l3, dev)?),
             (F32(s1), F32(s2), F32(s3)) => F32(inner(s1, l1, s2, l2, s3, l3, dev)?),
@@ -713,7 +713,7 @@ impl candle::CustomOp3 for RotaryEmbThd {
             ),
         };
         let dst = candle::cuda_backend::CudaStorage {
-            slice,
+            slice: std::mem::ManuallyDrop::new(slice),
             device: dev.clone(),
         };
         Ok((dst, l1.shape().clone()))
