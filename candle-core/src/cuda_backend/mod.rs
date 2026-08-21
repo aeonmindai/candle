@@ -17,6 +17,9 @@ mod device;
 mod error;
 mod utils;
 pub use device::{AllocCacheStats, CudaDevice, DeviceId};
+// ArcGraph capture safety: the counter callers assert on, and the retention
+// helper itself. See `device::arc_capture_retain_host`.
+pub use device::{arc_capture_dtoh_count, arc_capture_htod_retained, arc_capture_retain_host};
 pub use error::{CudaError, WrapErr};
 pub use utils::{Map1, Map1Any, Map2, Map2Any, Map2InPlace, Map3, S};
 
@@ -1788,43 +1791,43 @@ impl BackendStorage for CudaStorage {
     fn to_cpu_storage(&self) -> Result<CpuStorage> {
         match &*self.slice {
             CudaStorageSlice::U8(slice) => {
-                let cpu_storage = slice.stream().clone_dtoh(slice).w()?;
+                let cpu_storage = device::arc_capture_clone_dtoh(&self.device, slice)?;
                 Ok(CpuStorage::U8(cpu_storage))
             }
             CudaStorageSlice::U32(slice) => {
-                let cpu_storage = slice.stream().clone_dtoh(slice).w()?;
+                let cpu_storage = device::arc_capture_clone_dtoh(&self.device, slice)?;
                 Ok(CpuStorage::U32(cpu_storage))
             }
             CudaStorageSlice::I16(slice) => {
-                let cpu_storage = slice.stream().clone_dtoh(slice).w()?;
+                let cpu_storage = device::arc_capture_clone_dtoh(&self.device, slice)?;
                 Ok(CpuStorage::I16(cpu_storage))
             }
             CudaStorageSlice::I32(slice) => {
-                let cpu_storage = slice.stream().clone_dtoh(slice).w()?;
+                let cpu_storage = device::arc_capture_clone_dtoh(&self.device, slice)?;
                 Ok(CpuStorage::I32(cpu_storage))
             }
             CudaStorageSlice::I64(slice) => {
-                let cpu_storage = slice.stream().clone_dtoh(slice).w()?;
+                let cpu_storage = device::arc_capture_clone_dtoh(&self.device, slice)?;
                 Ok(CpuStorage::I64(cpu_storage))
             }
             CudaStorageSlice::BF16(slice) => {
-                let cpu_storage = slice.stream().clone_dtoh(slice).w()?;
+                let cpu_storage = device::arc_capture_clone_dtoh(&self.device, slice)?;
                 Ok(CpuStorage::BF16(cpu_storage))
             }
             CudaStorageSlice::F16(slice) => {
-                let cpu_storage = slice.stream().clone_dtoh(slice).w()?;
+                let cpu_storage = device::arc_capture_clone_dtoh(&self.device, slice)?;
                 Ok(CpuStorage::F16(cpu_storage))
             }
             CudaStorageSlice::F32(slice) => {
-                let cpu_storage = slice.stream().clone_dtoh(slice).w()?;
+                let cpu_storage = device::arc_capture_clone_dtoh(&self.device, slice)?;
                 Ok(CpuStorage::F32(cpu_storage))
             }
             CudaStorageSlice::F64(slice) => {
-                let cpu_storage = slice.stream().clone_dtoh(slice).w()?;
+                let cpu_storage = device::arc_capture_clone_dtoh(&self.device, slice)?;
                 Ok(CpuStorage::F64(cpu_storage))
             }
             CudaStorageSlice::F8E4M3(slice) => {
-                let cpu_storage = slice.stream().clone_dtoh(slice).w()?;
+                let cpu_storage = device::arc_capture_clone_dtoh(&self.device, slice)?;
                 Ok(CpuStorage::F8E4M3(cpu_storage))
             }
             CudaStorageSlice::F4(_)
